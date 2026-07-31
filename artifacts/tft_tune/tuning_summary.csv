@@ -1,5 +1,5 @@
 window,study_name,study_db,target_total_trials,n_trials_total,best_val_loss,best_trial_number
-7,tft_tune_w7,artifacts/tft_tune/window_7/study.db,30,31,0.007138704881072044,23
-10,tft_tune_w10,artifacts/tft_tune/window_10/study.db,30,30,0.007132827304303646,26
-15,tft_tune_w15,artifacts/tft_tune/window_15/study.db,30,30,0.006967694032937288,13
-30,tft_tune_w30,artifacts/tft_tune/window_30/study.db,30,30,0.006986111402511597,18
+7,tft_tune_w7,artifacts/tft_tune/window_7/study.db,30,30,0.007108095567673445,27
+10,tft_tune_w10,artifacts/tft_tune/window_10/study.db,30,30,0.007141925860196352,13
+15,tft_tune_w15,artifacts/tft_tune/window_15/study.db,30,30,0.00700227590277791,1
+30,tft_tune_w30,artifacts/tft_tune/window_30/study.db,30,30,0.007031736429780722,27

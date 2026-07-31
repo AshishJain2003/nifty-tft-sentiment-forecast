@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """
-Build high-quality TFT visualizations from per-window test predictions.
+Build TFT evaluation visualizations from the per-window test predictions.
 
-Run manually in conda env `ml`, for example:
-    conda activate ml
-    python src/6_tft_visualize.py
+Metrics are recomputed here from `test_predictions.csv` rather than read from
+`metrics.csv`, so the plots independently verify the numbers the training stage
+reported.
+
+Prices are rebuilt from the raw ticker file when it is available; otherwise the
+rupee prices already recorded in the prediction audit are used.
+
+    conda activate MarketFusion
+    python src/5_tft_visualize.py
 """
 
 from __future__ import annotations
@@ -12,12 +18,13 @@ from __future__ import annotations
 import argparse
 import math
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
 
@@ -27,6 +34,8 @@ DEFAULT_OUTPUT_DIR = Path("artifacts/visualizations")
 DEFAULT_WINDOWS = (7, 10, 15, 30)
 PREDICTION_REQUIRED_COLS = {"Symbol", "decoder_start_date", "pred_return", "true_return"}
 TICKER_REQUIRED_COLS = {"Date", "Symbol", "Adj Close"}
+ACTUAL_PRICE_COLOR = "#0D47A1"
+PREDICTED_PRICE_COLOR = "#81C784"
 
 
 def parse_windows(text: str) -> List[int]:
@@ -94,6 +103,16 @@ def compute_return_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, 
     }
 
 
+def select_middle_ranks(total: int, count: int = 4) -> Tuple[int, ...]:
+    """Centre `count` ranks of a `total`-length ranking, 1-indexed."""
+    if total < count:
+        raise ValueError(
+            f"Need at least {count} ranked stocks for a grouped plot, found {total}."
+        )
+    start = (total - count) // 2 + 1
+    return tuple(range(start, start + count))
+
+
 def load_ticker_prices(ticker_path: Path) -> pd.DataFrame:
     if not ticker_path.exists():
         raise FileNotFoundError(f"Ticker file not found: {ticker_path}")
@@ -131,6 +150,43 @@ def load_window_predictions(window: int, artifact_root: Path) -> pd.DataFrame:
     pred = pred.sort_values(["Symbol", "decoder_start_date"], kind="mergesort").reset_index(drop=True)
     pred["window"] = int(window)
     return pred
+
+
+def prices_from_prediction_audit(pred_df: pd.DataFrame, window: int) -> pd.DataFrame:
+    """Use the price columns the evaluation stage already wrote.
+
+    ``src/4_tft_hpt_train_test.py`` reconstructs both prices from the unscaled
+    ``adj_close_inr`` base, so this is the same arithmetic as
+    ``reconstruct_prices_inr`` without needing the raw ticker file, which is
+    gitignored and therefore absent in a fresh clone.
+    """
+    missing = sorted({"pred_price", "true_price"} - set(pred_df.columns))
+    if missing:
+        raise ValueError(
+            f"window={window}: prediction audit lacks {missing}. Pass --ticker-path "
+            "pointing at the raw ticker CSV to rebuild prices instead."
+        )
+
+    out = pred_df.copy()
+    out["actual_price_inr"] = pd.to_numeric(out["true_price"], errors="coerce")
+    out["pred_price_inr"] = pd.to_numeric(out["pred_price"], errors="coerce")
+
+    invalid = out["actual_price_inr"].isna() | out["pred_price_inr"].isna()
+    if bool(invalid.any()):
+        raise ValueError(
+            f"window={window}: {int(invalid.sum())} prediction rows have unusable "
+            "pred_price/true_price values."
+        )
+    # A z-scored base price (pre-fix datasets) produces near-zero, sometimes
+    # negative "prices". Refuse to plot those silently as rupees.
+    if (out["actual_price_inr"] <= 0).any():
+        raise ValueError(
+            f"window={window}: test_predictions.csv holds non-positive prices, which "
+            "means it was produced from a standardized price column. Re-run "
+            "src/3_feature_engineering.py and src/4_tft_hpt_train_test.py, or pass "
+            "--ticker-path to rebuild prices from the raw ticker file."
+        )
+    return out.sort_values(["Symbol", "decoder_start_date"], kind="mergesort").reset_index(drop=True)
 
 
 def reconstruct_prices_inr(pred_df: pd.DataFrame, ticker_df: pd.DataFrame, window: int) -> pd.DataFrame:
@@ -227,6 +283,73 @@ def validate_metric_ranges(metrics_df: pd.DataFrame) -> None:
         raise ValueError("Invalid metrics: f1_up must be in [0, 1].")
 
 
+def plot_symbol_actual_vs_predicted(
+    ax,
+    sym_df: pd.DataFrame,
+    symbol: str,
+    linewidth: float,
+    title_fontsize: int,
+    tick_fontsize: int,
+    title_pad: float,
+) -> None:
+    ax.plot(
+        sym_df["decoder_start_date"],
+        sym_df["actual_price_inr"],
+        color=ACTUAL_PRICE_COLOR,
+        linewidth=linewidth,
+        linestyle="-",
+        label="Actual Price",
+    )
+    ax.plot(
+        sym_df["decoder_start_date"],
+        sym_df["pred_price_inr"],
+        color=PREDICTED_PRICE_COLOR,
+        linewidth=linewidth,
+        linestyle="-",
+        label="Predicted Price",
+    )
+    ax.set_title(symbol, fontsize=title_fontsize, pad=title_pad)
+    ax.grid(alpha=0.22, linewidth=0.45)
+    ax.set_axisbelow(True)
+    ax.tick_params(axis="both", labelsize=tick_fontsize, length=2)
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=4))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b-%y"))
+    for tick in ax.get_xticklabels():
+        tick.set_rotation(30)
+        tick.set_ha("right")
+
+
+def build_price_legend_handles(linewidth: float) -> List[Line2D]:
+    return [
+        Line2D([0], [0], color=ACTUAL_PRICE_COLOR, lw=linewidth, linestyle="-", label="Actual Price"),
+        Line2D([0], [0], color=PREDICTED_PRICE_COLOR, lw=linewidth, linestyle="-", label="Predicted Price"),
+    ]
+
+
+def select_ranked_stock_group(best_stock_mape_df: pd.DataFrame, ranks: Iterable[int]) -> pd.DataFrame:
+    part = best_stock_mape_df.sort_values(["mape", "Symbol"], kind="mergesort").reset_index(drop=True).copy()
+    if part.empty:
+        raise ValueError("No stock-MAPE data found for grouped price plotting.")
+
+    ordered_ranks = [int(rank) for rank in ranks]
+    part["rank"] = np.arange(1, len(part) + 1, dtype=int)
+    selected = part.loc[part["rank"].isin(ordered_ranks)].copy()
+
+    if len(selected) != len(ordered_ranks):
+        found_ranks = set(selected["rank"].tolist())
+        missing = [rank for rank in ordered_ranks if rank not in found_ranks]
+        raise ValueError(f"Missing ranked stocks for requested MAPE positions: {missing}")
+
+    rank_order = {rank: idx for idx, rank in enumerate(ordered_ranks)}
+    selected["_rank_order"] = selected["rank"].map(rank_order)
+    selected = (
+        selected.sort_values("_rank_order", kind="mergesort")
+        .drop(columns="_rank_order")
+        .reset_index(drop=True)
+    )
+    return selected
+
+
 def plot_best_window_actual_vs_predicted(best_df: pd.DataFrame, output_path: Path, dpi: int, best_window: int) -> None:
     symbols = sorted(best_df["Symbol"].unique().tolist())
     if not symbols:
@@ -244,30 +367,15 @@ def plot_best_window_actual_vs_predicted(best_df: pd.DataFrame, output_path: Pat
             .sort_values("decoder_start_date", kind="mergesort")
             .copy()
         )
-        ax.plot(
-            sym["decoder_start_date"],
-            sym["actual_price_inr"],
-            color="#0D47A1",
+        plot_symbol_actual_vs_predicted(
+            ax=ax,
+            sym_df=sym,
+            symbol=symbol,
             linewidth=0.95,
-            linestyle="-",
-            label="Actual Price",
+            title_fontsize=8,
+            tick_fontsize=6,
+            title_pad=2.5,
         )
-        ax.plot(
-            sym["decoder_start_date"],
-            sym["pred_price_inr"],
-            color="#42A5F5",
-            linewidth=0.95,
-            linestyle="-",
-            label="Predicted Price",
-        )
-        ax.set_title(symbol, fontsize=8, pad=2.5)
-        ax.grid(alpha=0.22, linewidth=0.45)
-        ax.tick_params(axis="both", labelsize=6, length=2)
-        ax.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=4))
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b-%y"))
-        for tick in ax.get_xticklabels():
-            tick.set_rotation(30)
-            tick.set_ha("right")
 
     for j in range(len(symbols), len(axes_arr)):
         axes_arr[j].axis("off")
@@ -278,16 +386,70 @@ def plot_best_window_actual_vs_predicted(best_df: pd.DataFrame, output_path: Pat
         weight="bold",
         y=0.996,
     )
-    fig.text(0.5, 0.004, "Decoder Start Date", ha="center", fontsize=10)
     fig.text(0.004, 0.5, "Price (INR)", va="center", rotation=90, fontsize=10)
 
-    legend_handles = [
-        plt.Line2D([0], [0], color="#0D47A1", lw=1.0, linestyle="-", label="Actual Price"),
-        plt.Line2D([0], [0], color="#42A5F5", lw=1.0, linestyle="-", label="Predicted Price"),
-    ]
+    legend_handles = build_price_legend_handles(linewidth=1.0)
     fig.legend(handles=legend_handles, loc="upper center", ncol=2, fontsize=9, frameon=False, bbox_to_anchor=(0.5, 0.982))
 
     fig.tight_layout(rect=[0.015, 0.02, 1.0, 0.972])
+    fig.savefig(output_path, dpi=dpi)
+    plt.close(fig)
+
+
+def plot_ranked_stock_group_actual_vs_predicted(
+    best_df: pd.DataFrame,
+    ranked_group_df: pd.DataFrame,
+    output_path: Path,
+    dpi: int,
+    best_window: int,
+    group_title: str,
+) -> None:
+    if ranked_group_df.empty:
+        raise ValueError(f"No stock data found for grouped plot: {group_title}")
+
+    fig, axes = plt.subplots(nrows=2, ncols=2, figsize=(16, 8))
+    axes_arr = np.atleast_1d(axes).ravel()
+
+    for i, row in enumerate(ranked_group_df.itertuples(index=False)):
+        ax = axes_arr[i]
+        sym = (
+            best_df.loc[best_df["Symbol"] == row.Symbol]
+            .sort_values("decoder_start_date", kind="mergesort")
+            .copy()
+        )
+        if sym.empty:
+            raise ValueError(f"Missing best-window price series for symbol: {row.Symbol}")
+
+        plot_symbol_actual_vs_predicted(
+            ax=ax,
+            sym_df=sym,
+            symbol=str(row.Symbol),
+            linewidth=1.75,
+            title_fontsize=18,
+            tick_fontsize=11,
+            title_pad=5.5,
+        )
+
+    for j in range(len(ranked_group_df), len(axes_arr)):
+        axes_arr[j].axis("off")
+
+    fig.suptitle(
+        f"{group_title} - Best Window (W{best_window})",
+        fontsize=20,
+        weight="bold",
+        y=0.992,
+    )
+    fig.text(0.015, 0.5, "Price (INR)", va="center", rotation=90, fontsize=12)
+    fig.legend(
+        handles=build_price_legend_handles(linewidth=1.9),
+        loc="upper center",
+        ncol=2,
+        fontsize=12,
+        frameon=False,
+        bbox_to_anchor=(0.5, 0.962),
+    )
+
+    fig.tight_layout(rect=[0.02, 0.04, 1.0, 0.93])
     fig.savefig(output_path, dpi=dpi)
     plt.close(fig)
 
@@ -412,14 +574,26 @@ def main() -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    ticker_df = load_ticker_prices(ticker_path)
+    # The raw ticker file is the preferred source of truth: rebuilding prices
+    # from it independently cross-checks the evaluation stage. It is gitignored,
+    # so fall back to the prices the evaluation stage already wrote.
+    ticker_df = load_ticker_prices(ticker_path) if ticker_path.exists() else None
+    if ticker_df is None:
+        print(
+            f"[INFO] Ticker file not found ({ticker_path}); reconstructing prices "
+            "from the per-window prediction audit instead."
+        )
+
     all_windows_data: List[pd.DataFrame] = []
     metric_rows: List[Dict[str, float]] = []
     stock_rows: List[pd.DataFrame] = []
 
     for window in windows:
         pred_df = load_window_predictions(window=window, artifact_root=artifact_root)
-        enriched_df = reconstruct_prices_inr(pred_df=pred_df, ticker_df=ticker_df, window=window)
+        if ticker_df is not None:
+            enriched_df = reconstruct_prices_inr(pred_df=pred_df, ticker_df=ticker_df, window=window)
+        else:
+            enriched_df = prices_from_prediction_audit(pred_df=pred_df, window=window)
         all_windows_data.append(enriched_df)
         metric_rows.append(compute_window_metrics(enriched_df, window=window))
         stock_rows.append(compute_stock_mape(enriched_df, window=window))
@@ -440,7 +614,19 @@ def main() -> None:
     best_plot = output_dir / "best_window_actual_vs_predicted.png"
     metrics_plot = output_dir / "per_window_metrics.png"
     stock_plot = output_dir / "best_window_stock_mape.png"
+    lowest_mape_plot = output_dir / "best_window_lowest_4_mape_actual_vs_predicted.png"
+    middle_mape_plot = output_dir / "best_window_middle_4_mape_actual_vs_predicted.png"
+    highest_mape_plot = output_dir / "best_window_highest_4_mape_actual_vs_predicted.png"
     best_stock_mape_df = stock_mape_df.loc[stock_mape_df["window"] == best_window].copy()
+    total_ranked_stocks = int(len(best_stock_mape_df))
+    lowest_mape_ranks = (1, 2, 3, 4)
+    middle_mape_ranks = select_middle_ranks(total_ranked_stocks, count=4)
+    highest_mape_ranks = tuple(range(max(1, total_ranked_stocks - 3), total_ranked_stocks + 1))
+    ranked_group_specs = [
+        ("4 Lowest-MAPE Stocks", lowest_mape_ranks, lowest_mape_plot),
+        ("4 Middle-MAPE Stocks", middle_mape_ranks, middle_mape_plot),
+        ("4 Highest-MAPE Stocks", highest_mape_ranks, highest_mape_plot),
+    ]
 
     plot_best_window_actual_vs_predicted(best_df=best_df, output_path=best_plot, dpi=dpi, best_window=best_window)
     plot_per_window_metrics(metrics_df=metrics_df, output_path=metrics_plot, dpi=dpi)
@@ -450,8 +636,17 @@ def main() -> None:
         dpi=dpi,
         best_window=best_window,
     )
+    for group_title, ranks, group_output_path in ranked_group_specs:
+        ranked_group_df = select_ranked_stock_group(best_stock_mape_df=best_stock_mape_df, ranks=ranks)
+        plot_ranked_stock_group_actual_vs_predicted(
+            best_df=best_df,
+            ranked_group_df=ranked_group_df,
+            output_path=group_output_path,
+            dpi=dpi,
+            best_window=best_window,
+            group_title=group_title,
+        )
 
-    # Remove legacy CSV artifacts from earlier versions of this script.
     legacy_csvs = [
         output_dir / "recomputed_window_metrics.csv",
         output_dir / "stock_mape_by_window.csv",
@@ -465,6 +660,9 @@ def main() -> None:
     print(f"[INFO] Saved: {best_plot}")
     print(f"[INFO] Saved: {metrics_plot}")
     print(f"[INFO] Saved: {stock_plot}")
+    print(f"[INFO] Saved: {lowest_mape_plot}")
+    print(f"[INFO] Saved: {middle_mape_plot}")
+    print(f"[INFO] Saved: {highest_mape_plot}")
 
 
 if __name__ == "__main__":

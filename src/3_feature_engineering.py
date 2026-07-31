@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Build a flat master dataset for TFT training:
-- Engineers ticker features and next-day target.
-- Rolls non-trading-day news back to previous market trading day.
-- Merges news + ticker, creates time_idx, drops NaNs from warm-up/cool-down.
-- Applies per-symbol, leakage-safe scaling on ticker numeric features.
-- Writes a single CSV: dataset/nifty50_tft_master.csv
+Build the flat master training table for the TFT stage.
 
-Run this script inside conda env `ml`.
+- Engineers ticker features and the next-day return target.
+- Rolls non-trading-day news back to the previous market trading day.
+- Merges news + ticker, creates time_idx, drops NaNs from warm-up/cool-down.
+- Applies per-symbol scaling fit only on rows before TRAIN_CUTOFF_EXCLUSIVE.
+- Preserves one unscaled price column (adj_close_inr) so the evaluation stage
+  can reconstruct predictions in rupees.
+
+Output: dataset/tft_ready.csv
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ try:
     from sklearn.preprocessing import StandardScaler
 except ImportError as exc:
     raise ImportError(
-        "Missing dependency `scikit-learn`. Install inside conda env `ml` "
+        "Missing dependency `scikit-learn`. Install inside conda env `MarketFusion` "
         "(priority: conda install scikit-learn; fallback: conda-forge; last: pip)."
     ) from exc
 
@@ -31,20 +33,21 @@ try:
     from ta.trend import MACD
 except ImportError as exc:
     raise ImportError(
-        "Missing dependency `ta`. Install inside conda env `ml` "
+        "Missing dependency `ta`. Install inside conda env `MarketFusion` "
         "(priority: conda install -c conda-forge ta; last resort: pip install ta)."
     ) from exc
 
 
-# ----------------------------
-# Config
-# ----------------------------
 NEWS_PATH = Path("dataset/news_sentiment.csv")
 TICKER_PRIMARY_PATH = Path("dataset/stock_dataset/nifty50_ticker.csv")
 OUTPUT_PATH = Path("dataset/tft_ready.csv")
 
 TRAIN_CUTOFF_EXCLUSIVE = pd.Timestamp("2025-01-01")  # fit scalers on rows before this date
 MA_WINDOWS = (5, 10, 20, 50)
+
+# Unscaled copy of `Adj Close`, kept out of the standardization step so the
+# evaluation stage has a genuine INR base price to reconstruct from.
+PRICE_INR_COL = "adj_close_inr"
 
 USELESS_TICKER_COLS = ["Company", "Index", "Dividends", "Stock Splits"]
 OHLCV_COLS = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
@@ -238,7 +241,9 @@ def scale_ticker_numeric_features(
 ) -> pd.DataFrame:
     out = df.copy()
 
-    exclude = set(SENTIMENT_COLS + COUNT_COLS + ["target_pct_change", "time_idx"])
+    exclude = set(
+        SENTIMENT_COLS + COUNT_COLS + ["target_pct_change", "time_idx", PRICE_INR_COL]
+    )
     numeric_cols = [
         col
         for col in out.columns
@@ -315,6 +320,9 @@ def run_pipeline() -> pd.DataFrame:
     print(f"[INFO] Dropped {before_drop - len(merged)} rows with NaN (warm-up/cool-down and invalids).")
     merged = add_time_idx(merged)
 
+    # Snapshot the real rupee price before standardization consumes `Adj Close`.
+    merged[PRICE_INR_COL] = merged["Adj Close"].astype(np.float64)
+
     merged = scale_ticker_numeric_features(merged, TRAIN_CUTOFF_EXCLUSIVE)
     merged = downcast_numeric_dtypes(merged)
 
@@ -325,6 +333,11 @@ def run_pipeline() -> pd.DataFrame:
         raise ValueError("time_idx must be continuous with no gaps.")
     if merged.isna().any().any():
         raise ValueError("Final dataset still contains NaN values.")
+    if (merged[PRICE_INR_COL] <= 0).any():
+        raise ValueError(
+            f"{PRICE_INR_COL} must stay positive — it is the unscaled base price "
+            "used for price-space evaluation."
+        )
 
     return merged
 

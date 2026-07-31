@@ -1,24 +1,24 @@
 {
   "best_params": {
     "attention_head_size_v2": 1,
-    "dropout": 0.15877715505869547,
-    "gradient_clip_val": 0.7143864021758412,
-    "hidden_continuous_size_v2": 16,
-    "hidden_size_v2": 48,
-    "learning_rate": 0.00014629184543133805
+    "dropout": 0.10617534828874074,
+    "gradient_clip_val": 0.9729188669457949,
+    "hidden_continuous_size_v2": 8,
+    "hidden_size_v2": 16,
+    "learning_rate": 0.0005611516415334506
   },
-  "best_trial_number": 13,
+  "best_trial_number": 1,
   "best_user_attrs": {
-    "best_checkpoint": "/home/mveen/Desktop/S26/INLP/root/artifacts/tft_tune/window_15/trials/trial_00013/checkpoints/best-epoch005-valloss0.006968.ckpt",
+    "best_checkpoint": "/home/mveen/Documents/INLP/artifacts/tft_tune/window_15/trials/trial_00001/checkpoints/best-epoch003-valloss0.007002.ckpt",
     "effective_attention_head_size": 1,
-    "effective_hidden_continuous_size": 16,
-    "effective_hidden_size": 48,
-    "effective_precision": "16-mixed"
+    "effective_hidden_continuous_size": 8,
+    "effective_hidden_size": 16,
+    "effective_precision": "bf16-mixed"
   },
-  "best_val_loss": 0.006967694032937288,
+  "best_val_loss": 0.00700227590277791,
   "n_trials_total": 30,
   "study_db": "artifacts/tft_tune/window_15/study.db",
   "target_total_trials": 30,
-  "updated_at": "2026-04-15T20:11:47Z",
+  "updated_at": "2026-07-27T14:23:05Z",
   "window": 15
 }

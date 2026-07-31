@@ -1,34 +1,18 @@
 #!/usr/bin/env python3
 """
-Moneycontrol — High-Performance Async Scraper (with Resume)
-=============================================================
-Scrapes article data (date, title, news, url) from paginated video news
-listing pages on moneycontrol.com and streams results into a CSV file.
+Moneycontrol async scraper.
 
-Bot-Protection Bypass
----------------------
-* Uses `curl_cffi` for TLS/JA3 impersonation of Chrome (bypasses WAF 403s).
+Collects date, title, news and url from paginated video news listing pages on
+moneycontrol.com and streams the rows into a CSV. Requests go through
+`curl_cffi` for TLS/JA3 impersonation, which is what gets past the WAF; HTML
+parsing runs in a ProcessPoolExecutor.
 
-Crash-Resilient Resume System (3 Layers)
------------------------------------------
-1. Checkpoint File — JSON saved after every page (atomic write-then-rename)
-2. URL Dedup Set   — reads existing CSV URLs at startup → zero duplicates
-3. Atomic Writes   — checkpoint uses tmp→rename; CSV append with flush
+A run resumes after a crash: a JSON checkpoint is written after every page
+(write-then-rename), and URLs already present in the CSV are loaded at startup
+so nothing is scraped twice.
 
-Architecture
-------------
-* asyncio + curl_cffi  → IO-bound network concurrency with TLS impersonation
-* ProcessPoolExecutor  → CPU-bound HTML parsing on all 12 logical cores
-* asyncio.Semaphore    → configurable request-level throttle
-* Exponential backoff  → retry resilience against 429 / 5xx errors
-* CSV streaming        → constant-memory output regardless of run length
-
-Usage
------
-    conda activate ml
-    pip install curl_cffi   # if not already installed
-    cd src/scrapers
-    python moneycontrol_scraper.py
+    conda activate MarketFusion
+    python src/scrapers/moneycontrol_scraper.py
 """
 
 from __future__ import annotations
@@ -53,9 +37,6 @@ from typing import Optional
 from bs4 import BeautifulSoup
 from curl_cffi import requests
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION
-# ═══════════════════════════════════════════════════════════════════════════════
 
 STOP_DATE: str = "2020-01-01"
 WEBSITE_NAME: str = "moneycontrol"
@@ -64,27 +45,27 @@ SECTION_URLS: list[str] = [
     "https://www.moneycontrol.com/news/videos",
 ]
 
-# ── Concurrency knobs ─────────────────────────────────────────────────────────
-MAX_CONCURRENT_REQUESTS: int = 15      # Semaphore — conservative for MC
+# Concurrency knobs
+MAX_CONCURRENT_REQUESTS: int = 15      # Semaphore - conservative for MC
 ARTICLES_PER_BATCH: int = 8
 
-# ── Retry / backoff ───────────────────────────────────────────────────────────
+# Retry / backoff
 MAX_RETRIES: int = 5
 INITIAL_BACKOFF_S: float = 2.0
 BACKOFF_MULTIPLIER: float = 2.0
 BACKOFF_JITTER: float = 1.0
 
-# ── CPU offloading ────────────────────────────────────────────────────────────
-PARSER_WORKERS: int | None = None      # None → os.cpu_count() (12 threads)
+# CPU offloading
+PARSER_WORKERS: int | None = None      # None -> os.cpu_count() (12 threads)
 
-# ── Delays ────────────────────────────────────────────────────────────────────
+# Delays
 PAGE_DELAY_S: float = 1.0
 ARTICLE_FETCH_DELAY_S: tuple[float, float] = (0.2, 0.8)
 
-# ── Timeout per request (seconds) ────────────────────────────────────────────
+# Timeout per request (seconds)
 REQUEST_TIMEOUT_S: int = 30
 
-# ── curl_cffi impersonation ───────────────────────────────────────────────────
+# curl_cffi impersonation
 IMPERSONATE_BROWSER = "chrome120"
 
 BASE_HEADERS: dict[str, str] = {
@@ -97,9 +78,6 @@ BASE_HEADERS: dict[str, str] = {
     "Sec-Fetch-User": "?1",
 }
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# LOGGING & PATHS
-# ═══════════════════════════════════════════════════════════════════════════════
 
 logging.basicConfig(
     level=logging.INFO,
@@ -115,9 +93,6 @@ OUTPUT_FILE = OUTPUT_DIR / f"{WEBSITE_NAME}_raw.csv"
 CHECKPOINT_DIR = OUTPUT_DIR / "checkpoint"
 CHECKPOINT_FILE = CHECKPOINT_DIR / f"{WEBSITE_NAME}_checkpoint.json"
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CHECKPOINT / RESUME SYSTEM
-# ═══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class Checkpoint:
@@ -174,10 +149,6 @@ def load_scraped_urls(csv_path: Path) -> set[str]:
     return urls
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# DATA STRUCTURES
-# ═══════════════════════════════════════════════════════════════════════════════
-
 @dataclass
 class Article:
     date: str
@@ -212,12 +183,8 @@ class ScraperStats:
         )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CPU-BOUND PARSERS
-# ═══════════════════════════════════════════════════════════════════════════════
-
 # Since we only scrape from /news/videos/page-N/ listing pages,
-# every article link on these pages IS a video — regardless of its URL path.
+# every article link on these pages IS a video - regardless of its URL path.
 # Older video articles (pre-2022) use category paths like /news/business/stocks/
 # instead of /news/videos/, so we match /news/ and /world/ paths broadly.
 _MC_ARTICLE_RE = re.compile(
@@ -284,14 +251,14 @@ def _parse_date_str(date_str: str) -> str:
 def _parse_article_page(html: str, url: str) -> Optional[dict]:
     """Extract date, title, and body from a Moneycontrol article page.
 
-    Strategy: JSON-LD (most reliable) → HTML fallback
+    Strategy: JSON-LD (most reliable) -> HTML fallback
     """
     soup = BeautifulSoup(html, "lxml")
     title = ""
     date_val = ""
     news = ""
 
-    # ── JSON-LD ───────────────────────────────────────────────────────────
+    # JSON-LD
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.string, strict=False)
@@ -312,7 +279,7 @@ def _parse_article_page(html: str, url: str) -> Optional[dict]:
         except Exception:
             pass
 
-    # ── HTML Fallback ─────────────────────────────────────────────────────
+    # HTML Fallback
     if not title:
         h1 = soup.find("h1")
         if h1:
@@ -362,10 +329,6 @@ def _parse_article_page(html: str, url: str) -> Optional[dict]:
 
     return {"date": parsed_date, "title": title, "news": news, "url": url}
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ASYNC FETCHER  (curl_cffi with TLS impersonation)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class AsyncFetcher:
     def __init__(
@@ -436,10 +399,6 @@ class AsyncFetcher:
         return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CSV WRITER
-# ═══════════════════════════════════════════════════════════════════════════════
-
 class CSVWriter:
     def __init__(self, filepath: Path):
         self._path = filepath
@@ -468,10 +427,6 @@ class CSVWriter:
         if self._file:
             self._file.close()
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN SCRAPER ENGINE
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class MoneycontrolScraper:
     def __init__(self):
@@ -725,10 +680,6 @@ class MoneycontrolScraper:
             return None
         return Article(**parsed)
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
     log.info("Moneycontrol Scraper (curl_cffi + TLS impersonation)")

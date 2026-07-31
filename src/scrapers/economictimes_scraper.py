@@ -1,40 +1,18 @@
 #!/usr/bin/env python3
 """
-Economic Times — Sitemap-Based Historical Scraper (2020 → present)
-====================================================================
-Bypasses the lazy-load API's ~140-page depth limit by crawling ET's
-monthly XML sitemaps directly:
+Economic Times historical scraper, 2020 to present.
 
-   Sitemap Index → monthly XML files → article URLs → article pages
+The lazy-load API stops at roughly 140 pages, so this crawls the monthly XML
+sitemaps instead: sitemap index -> monthly XML -> article URLs -> article pages.
+Only URLs under TARGET_PATH_PREFIX are kept, and article bodies come from
+JSON-LD with an HTML fallback. Rows are appended to the same
+economictimes_raw.csv the other scrapers write.
 
-Pipeline
---------
-1. Fetch sitemap index:
-       https://economictimes.indiatimes.com/etstatic/sitemaps/et/news/sitemap-index.xml
-   → list of monthly sitemaps, e.g. 2020-January-1.xml, 2020-February-1.xml …
+A run resumes after a crash: a JSON checkpoint records the last completed
+sitemap file, and URLs already present in the CSV are skipped at startup.
 
-2. For each monthly sitemap (from current month back to STOP_DATE):
-   - Parse all <url> entries (each has <loc> and <lastmod>)
-   - Filter only URLs from TARGET_PATH_PREFIX (markets/stocks/news)
-   - Skip URLs already in the CSV (dedup)
-
-3. For each new article URL, fetch the HTML page and parse:
-   - JSON-LD articleBody  (fastest)
-   - HTML .artText / .article-txt paragraphs (fallback)
-   - title from JSON-LD or <h1>
-
-4. Append to the SAME economictimes_raw.csv (compatible format).
-
-Crash-Resilient Resume (3 layers)
-----------------------------------
-1. Checkpoint JSON — records last completed sitemap file + processed count
-2. URL dedup set  — all URLs already in the CSV are skipped on startup
-3. Atomic writes  — CSV append with flush; checkpoint via tmp→rename
-
-Environment
------------
-    conda activate ml
-    python3 economictimes_scraper.py
+    conda activate MarketFusion
+    python src/scrapers/economictimes_scraper.py
 """
 
 from __future__ import annotations
@@ -61,7 +39,7 @@ from xml.etree import ElementTree as ET
 from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
 
-# ── Logging ───────────────────────────────────────────────────────────────────
+# Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s │ %(levelname)-7s │ %(message)s",
@@ -69,7 +47,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("ET-sitemap")
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
+# Paths
 SCRIPT_DIR   = Path(__file__).resolve().parent
 RAW_DIR      = (SCRIPT_DIR / ".." / ".." / "dataset" / "raw_dataset").resolve()
 CHECKPOINT_DIR = RAW_DIR / "checkpoint"
@@ -80,7 +58,7 @@ CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_CSV      = RAW_DIR / "economictimes_raw.csv"
 CHECKPOINT_FILE = CHECKPOINT_DIR / "economictimes_checkpoint.json"
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# Config
 STOP_DATE   = date(2020, 1, 1)       # do not scrape articles older than this
 BASE_URL    = "https://economictimes.indiatimes.com"
 SITEMAP_INDEX = (
@@ -91,18 +69,18 @@ SITEMAP_INDEX = (
 # Only keep articles from this section
 TARGET_PATH_PREFIX = "/markets/stocks/news/"
 
-# ── Concurrency ───────────────────────────────────────────────────────────────
+# Concurrency
 MAX_CONCURRENT_REQUESTS: int = 20
 ARTICLES_PER_BATCH:       int = 25
-PARSER_WORKERS:     int | None = None   # None → os.cpu_count()
+PARSER_WORKERS:     int | None = None   # None -> os.cpu_count()
 
-# ── Retry / rate ──────────────────────────────────────────────────────────────
+# Retry / rate
 PAGE_DELAY_S: tuple[float, float] = (0.15, 0.4)
 MAX_RETRIES:   int   = 5
 BACKOFF_BASE:  float = 2.0
 JITTER_MAX:    float = 1.0
 
-# ── TLS impersonation ─────────────────────────────────────────────────────────
+# TLS impersonation
 IMPERSONATE_BROWSER = "chrome124"
 
 USER_AGENTS = [
@@ -130,13 +108,9 @@ XML_HEADERS: dict[str, str] = {
     "DNT": "1",
 }
 
-# ── Namespaces in ET sitemap XML ──────────────────────────────────────────────
+# Namespaces in ET sitemap XML
 NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# DATA STRUCTURES
-# ═══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class Article:
@@ -173,10 +147,6 @@ class Stats:
         )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ARTICLE HTML PARSER  (CPU-bound — runs in ProcessPoolExecutor)
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def _parse_article(html: str, url: str) -> tuple[Optional[str], Optional[str]]:
     """Parse title and body from an ET article page HTML.
 
@@ -186,7 +156,7 @@ def _parse_article(html: str, url: str) -> tuple[Optional[str], Optional[str]]:
     title: Optional[str] = None
     body:  Optional[str] = None
 
-    # ── JSON-LD (highest quality) ──────────────────────────────────────────
+    # JSON-LD (highest quality)
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.string or "", strict=False)
@@ -204,7 +174,7 @@ def _parse_article(html: str, url: str) -> tuple[Optional[str], Optional[str]]:
         if body:
             break
 
-    # ── Title fallback ─────────────────────────────────────────────────────
+    # Title fallback
     if not title:
         h1 = soup.find("h1")
         if h1:
@@ -212,7 +182,7 @@ def _parse_article(html: str, url: str) -> tuple[Optional[str], Optional[str]]:
         elif soup.title:
             title = soup.title.get_text(strip=True).split("|")[0].strip()
 
-    # ── Body fallback: ET article selectors ───────────────────────────────
+    # Body fallback: ET article selectors
     if not body:
         selectors = [
             ".artText p",
@@ -244,10 +214,6 @@ def _parse_article(html: str, url: str) -> tuple[Optional[str], Optional[str]]:
     return (title or None, body or None)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CHECKPOINT I/O
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def _load_checkpoint() -> SitemapCheckpoint:
     if CHECKPOINT_FILE.exists():
         try:
@@ -269,10 +235,6 @@ def _save_checkpoint(cp: SitemapCheckpoint) -> None:
     }, indent=2))
     tmp.replace(CHECKPOINT_FILE)
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# CSV WRITER
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class CsvWriter:
     FIELDS = ["date", "title", "news", "url"]
@@ -304,10 +266,6 @@ class CsvWriter:
     async def close(self) -> None:
         self._fh.close()
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ASYNC FETCHER
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class AsyncFetcher:
     def __init__(self, session: AsyncSession, sem: asyncio.Semaphore,
@@ -378,10 +336,6 @@ class AsyncFetcher:
         return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SITEMAP PARSING HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def _parse_sitemap_index(xml_text: str) -> list[str]:
     """Extract all monthly sitemap URLs from the sitemap index XML."""
     root = ET.fromstring(xml_text.encode())
@@ -413,8 +367,8 @@ def _parse_monthly_sitemap(xml_text: str) -> list[tuple[str, str]]:
 def _sitemap_date(url: str) -> Optional[date]:
     """Extract the date a sitemap file covers from its URL.
 
-    e.g. .../2020-January-1.xml → date(2020, 1, 1)
-         .../2025-March-2.xml   → date(2025, 3, 1)
+    e.g. .../2020-January-1.xml -> date(2020, 1, 1)
+         .../2025-March-2.xml   -> date(2025, 3, 1)
     """
     m = re.search(r"/(\d{4})-([A-Za-z]+)-\d+\.xml", url)
     if not m:
@@ -436,10 +390,6 @@ def _article_date_from_lastmod(lastmod: str) -> str:
     except Exception:
         return lastmod[:10] if len(lastmod) >= 10 else ""
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN SCRAPER
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class EtSitemapScraper:
     def __init__(self) -> None:
@@ -625,7 +575,7 @@ class EtSitemapScraper:
                     url=url,
                 )
                 articles_to_write.append(article)
-                # NOTE: do NOT add to scraped_urls here —
+                # NOTE: do NOT add to scraped_urls here -
                 # write_many adds to self._existing (same set) after the disk write.
                 self.stats.articles_scraped += 1
 
@@ -635,10 +585,6 @@ class EtSitemapScraper:
             if self.stats.articles_scraped % 100 == 0 and self.stats.articles_scraped > 0:
                 log.info("  ├─ %s", self.stats.summary())
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     scraper = EtSitemapScraper()

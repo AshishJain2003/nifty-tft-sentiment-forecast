@@ -1,34 +1,18 @@
 #!/usr/bin/env python3
 """
-Financial Express — High-Performance Async Scraper (with Resume)
-=================================================================
-Scrapes article data (date, title, news, url) from paginated listing pages
-on financialexpress.com and streams results into a CSV file.
+Financial Express async scraper.
 
-Crash-Resilient Resume System
------------------------------
-* A JSON checkpoint file tracks: section index + last completed page number.
-* On startup, the scraper loads already-scraped URLs from the existing CSV
-  to avoid duplicate rows.
-* After every page is fully processed, the checkpoint is saved to disk.
-* On restart (after crash, Ctrl-C, or network failure) the scraper jumps
-  directly to the section & page where it left off — zero wasted work.
-* To force a fresh start, delete the checkpoint file  (or the CSV + checkpoint).
+Collects date, title, news and url from paginated listing pages on
+financialexpress.com and streams the rows into a CSV. Network I/O runs on
+asyncio + aiohttp under a semaphore with exponential backoff; HTML parsing runs
+in a ProcessPoolExecutor.
 
-Architecture
-------------
-* asyncio + aiohttp   → IO-bound network concurrency
-* ProcessPoolExecutor → CPU-bound HTML parsing on all logical cores
-* asyncio.Semaphore   → configurable request-level throttle
-* aiohttp.TCPConnector → connection pooling with high limits
-* Exponential backoff  → retry resilience against 429 / 5xx errors
-* CSV streaming        → constant-memory output regardless of run length
+A run resumes after a crash: a JSON checkpoint tracks the section index and last
+completed page, and URLs already present in the CSV are loaded at startup so
+nothing is scraped twice. Delete the checkpoint to force a fresh start.
 
-Usage
------
-    conda activate ml
-    cd src/scrapers
-    python financialexpress_scraper.py
+    conda activate MarketFusion
+    python src/scrapers/financialexpress_scraper.py
 """
 
 from __future__ import annotations
@@ -52,9 +36,6 @@ from typing import Optional
 import aiohttp
 from bs4 import BeautifulSoup
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION — edit these knobs freely
-# ═══════════════════════════════════════════════════════════════════════════════
 
 # Date threshold: stop paginating a section once articles fall before this date.
 # Change to e.g. "2020-01-01" for deep historical scraping.
@@ -69,29 +50,29 @@ SECTION_URLS: list[str] = [
     "https://www.financialexpress.com/market/page/{page}/",
 ]
 
-# ── Concurrency knobs ─────────────────────────────────────────────────────────
+# Concurrency knobs
 MAX_CONCURRENT_REQUESTS: int = 60      # Semaphore limit for aiohttp calls
 TCP_CONNECTOR_LIMIT: int = 100         # aiohttp TCPConnector pool size
 TCP_CONNECTOR_PER_HOST: int = 30       # per-host connection ceiling
 ARTICLES_PER_BATCH: int = 20           # articles processed concurrently per page
 
-# ── Retry / backoff ───────────────────────────────────────────────────────────
+# Retry / backoff
 MAX_RETRIES: int = 5
 INITIAL_BACKOFF_S: float = 1.0
 BACKOFF_MULTIPLIER: float = 2.0
-BACKOFF_JITTER: float = 0.5           # random ±jitter added to backoff
+BACKOFF_JITTER: float = 0.5           # random +/-jitter added to backoff
 
-# ── CPU offloading ────────────────────────────────────────────────────────────
-# None → defaults to os.cpu_count()  (12 logical threads on your Ryzen 7)
+# CPU offloading
+# None -> defaults to os.cpu_count()
 PARSER_WORKERS: int | None = None
 
-# ── Politeness delay (seconds) between successive pagination requests ─────────
+# Politeness delay (seconds) between successive pagination requests
 PAGE_DELAY_S: float = 0.3
 
-# ── Timeout per request (seconds) ────────────────────────────────────────────
+# Timeout per request (seconds)
 REQUEST_TIMEOUT_S: int = 30
 
-# ── User-Agent rotation pool ─────────────────────────────────────────────────
+# User-Agent rotation pool
 USER_AGENTS: list[str] = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
@@ -103,9 +84,6 @@ USER_AGENTS: list[str] = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 ]
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# LOGGING
-# ═══════════════════════════════════════════════════════════════════════════════
 
 logging.basicConfig(
     level=logging.INFO,
@@ -114,9 +92,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("fe_scraper")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# PATH RESOLUTION
-# ═══════════════════════════════════════════════════════════════════════════════
 
 # The script lives at  <root>/src/scrapers/financialexpress_scraper.py
 # Output goes to       <root>/dataset/raw_dataset/<website>_raw.csv
@@ -127,9 +102,6 @@ OUTPUT_FILE = OUTPUT_DIR / f"{WEBSITE_NAME}_raw.csv"
 CHECKPOINT_DIR = OUTPUT_DIR / "checkpoint"
 CHECKPOINT_FILE = CHECKPOINT_DIR / f"{WEBSITE_NAME}_checkpoint.json"
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CHECKPOINT / RESUME SYSTEM
-# ═══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class Checkpoint:
@@ -138,24 +110,18 @@ class Checkpoint:
     State is saved as JSON after every fully-processed page:
         {
             "section_pages": {
-                "0": 6190,    # section 0 (business) → last completed page 6190
-                "1": 1367     # section 1 (market) → last completed page 1367
+                "0": 6190,    # section 0 (business) -> last completed page 6190
+                "1": 1367     # section 1 (market) -> last completed page 1367
             },
             "completed_sections": [0],   # section indices that are fully done
             "version": 2
         }
-
-    On restart the scraper:
-        1. Loads this file (if it exists).
-        2. Reads the existing CSV to build a set of already-scraped URLs.
-        3. Resumes each section from its last completed page.
-        4. Deduplicates any articles within a partially-completed page.
     """
-    section_pages: dict[int, int] = field(default_factory=dict)  # section_idx → last_completed_page
+    section_pages: dict[int, int] = field(default_factory=dict)  # section_idx -> last_completed_page
     completed_sections: list[int] = field(default_factory=list)
     version: int = 2
 
-    # ── Persistence ───────────────────────────────────────────────────────
+    # Persistence
     def save(self, path: Path) -> None:
         """Atomically write checkpoint to disk (write-then-rename)."""
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -223,10 +189,9 @@ class Checkpoint:
 def load_scraped_urls(csv_path: Path) -> set[str]:
     """Read the 'url' column from an existing CSV to build a dedup set.
 
-    This is called once at startup so we never re-scrape + re-write an
-    article that is already in the output file.  The set lives in memory
-    but only stores URL strings (~200 bytes each), so even 500K articles
-    would only use ~100 MB.
+    Called once at startup so an article already in the output file is never
+    re-scraped. The set holds URL strings only, so even 500K articles cost
+    roughly 100 MB.
     """
     urls: set[str] = set()
     if not csv_path.exists():
@@ -244,10 +209,6 @@ def load_scraped_urls(csv_path: Path) -> set[str]:
         log.info("  Loaded %d already-scraped URLs from CSV for dedup", len(urls))
     return urls
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# DATA STRUCTURES
-# ═══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class Article:
@@ -283,9 +244,6 @@ class ScraperStats:
             f"retries={self.retries_total}"
         )
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CPU-BOUND PARSERS  (run inside ProcessPoolExecutor)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def _parse_listing_page(html: str, base_url: str) -> list[str]:
     """Extract article URLs from a section listing page.
@@ -307,7 +265,7 @@ def _parse_listing_page(html: str, base_url: str) -> list[str]:
         # Must be an absolute financialexpress.com article link
         if not href.startswith("https://www.financialexpress.com/"):
             continue
-        # Skip pagination / category links — real articles end with digit + /
+        # Skip pagination / category links - real articles end with digit + /
         if not _is_article_url(href):
             continue
         if href not in seen:
@@ -342,7 +300,7 @@ def _parse_article_page(html: str, url: str) -> Optional[dict]:
     """
     soup = BeautifulSoup(html, "lxml")
 
-    # ── Title ─────────────────────────────────────────────────────────────
+    # Title
     title = ""
     h1 = soup.find("h1")
     if h1:
@@ -355,7 +313,7 @@ def _parse_article_page(html: str, url: str) -> Optional[dict]:
     if not title:
         return None  # unusable article
 
-    # ── Date ──────────────────────────────────────────────────────────────
+    # Date
     pub_date = ""
     meta_time = soup.find("meta", property="article:published_time")
     if meta_time and meta_time.get("content"):
@@ -376,7 +334,7 @@ def _parse_article_page(html: str, url: str) -> Optional[dict]:
             except ValueError:
                 pub_date = raw[:10]
 
-    # ── Body content ──────────────────────────────────────────────────────
+    # Body content
     paragraphs: list[str] = []
 
     # Primary container: .wp-block-post-content or .entry-content
@@ -410,9 +368,6 @@ def _parse_article_page(html: str, url: str) -> Optional[dict]:
 
     return {"date": pub_date, "title": title, "news": news_body, "url": url}
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ASYNC NETWORK LAYER
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class AsyncFetcher:
     """Thin wrapper around aiohttp with semaphore + exponential backoff."""
@@ -445,7 +400,7 @@ class AsyncFetcher:
                             log.debug("404 → %s", url)
                             return None
                         if resp.status in (429, 503):
-                            # Rate-limited or overloaded — back off
+                            # Rate-limited or overloaded - back off
                             raise aiohttp.ClientResponseError(
                                 resp.request_info,
                                 resp.history,
@@ -459,7 +414,7 @@ class AsyncFetcher:
                                 status=resp.status,
                                 message=f"HTTP {resp.status}",
                             )
-                        # Other 4xx — don't retry
+                        # Other 4xx - don't retry
                         log.warning("HTTP %d → %s (not retrying)", resp.status, url)
                         return None
 
@@ -484,9 +439,6 @@ class AsyncFetcher:
                     return None
         return None
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CSV WRITER (thread-safe via asyncio.Lock)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class CSVWriter:
     """Appends Article rows to a CSV file, flushing after every write."""
@@ -519,9 +471,6 @@ class CSVWriter:
         if self._file:
             self._file.close()
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN SCRAPER ENGINE
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class FinancialExpressScraper:
     """Coordinates pagination, link extraction, article parsing and CSV I/O."""
@@ -532,11 +481,11 @@ class FinancialExpressScraper:
         self.csv_writer = CSVWriter(OUTPUT_FILE)
         self._shutdown = False
 
-        # ── Resume state ──────────────────────────────────────────────────
+        # Resume state
         self.checkpoint = Checkpoint.load(CHECKPOINT_FILE)
         self.scraped_urls: set[str] = load_scraped_urls(OUTPUT_FILE)
 
-    # ── Graceful shutdown on Ctrl-C ───────────────────────────────────────
+    # Graceful shutdown on Ctrl-C
     def _install_signal_handlers(self):
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, self._handle_signal)
@@ -545,7 +494,7 @@ class FinancialExpressScraper:
         log.warning("Received signal %s — finishing current batch then saving checkpoint…", signum)
         self._shutdown = True
 
-    # ── Entry point ───────────────────────────────────────────────────────
+    # Entry point
     async def run(self):
         self._install_signal_handlers()
         await self.csv_writer.open()
@@ -608,7 +557,7 @@ class FinancialExpressScraper:
 
         log.info("═══ DONE ═══  %s", self.stats.summary())
 
-    # ── Section-level pagination loop ─────────────────────────────────────
+    # Section-level pagination loop
     async def _scrape_section(
         self,
         section_idx: int,
@@ -665,7 +614,7 @@ class FinancialExpressScraper:
             else:
                 should_stop = False
 
-            # ── Save checkpoint after each page ───────────────────────────
+            # Save checkpoint after each page
             self.checkpoint.set_last_page(section_idx, page_num)
             self.checkpoint.save(CHECKPOINT_FILE)
 
@@ -688,7 +637,7 @@ class FinancialExpressScraper:
 
         log.info("◀ Finished section: %s  %s", section_name, self.stats.summary())
 
-    # ── Batch article processing ──────────────────────────────────────────
+    # Batch article processing
     async def _process_articles(
         self,
         urls: list[str],
@@ -785,9 +734,6 @@ class FinancialExpressScraper:
 
         return Article(**parsed)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
     # Pre-flight checks

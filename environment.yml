@@ -1,0 +1,82 @@
+# Conda environment for the Nifty50 news-sentiment -> TFT forecasting pipeline.
+#
+#   conda env create -f environment.yml
+#   conda activate MarketFusion
+#   python -m pip check
+#
+# Version pins are deliberate. pytorch-forecasting 1.1.1 is sensitive to major
+# version drift in torch / lightning / numpy, and the published metrics in
+# artifacts/ were produced with exactly this set. Bump one pin at a time.
+#
+# Target host: Ubuntu, 6-core CPU, 16 GB RAM, RTX 3050 4 GB (sm_86, CUDA 11.8).
+# On a machine without an NVIDIA GPU, replace the `pytorch-cuda` line with
+# `cpuonly` from the pytorch channel; every stage falls back to CPU.
+
+name: MarketFusion
+
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Interpreter
+  - python=3.10
+  - pip
+  # setuptools >=81 dropped `pkg_resources`, which lightning==2.2.5 still
+  # imports at startup. Unpinned, the solver takes the newest build and
+  # lightning fails with ModuleNotFoundError: No module named 'pkg_resources'.
+  - setuptools<81
+  - wheel
+
+  # Scientific core
+  - numpy=1.26.4
+  - pandas=2.2.2
+  - scipy=1.15.3
+  - scikit-learn=1.4.2
+  - pyarrow=16.0.0
+  - matplotlib=3.8.*
+  - tqdm
+
+  # Deep learning
+  - pytorch=2.2.2
+  - torchvision=0.17.2
+  - torchaudio=2.2.2
+  - pytorch-cuda=11.8
+
+  # Forecasting / tuning
+  # 2.2.5, not 2.2.4: conda-forge has no `pytorch-lightning=2.2.4` build (it
+  # jumps 2.2.3 -> 2.2.5). Code here imports only `lightning.pytorch`, so the
+  # patch bump does not change any import path.
+  - lightning=2.2.5
+  - pytorch-lightning=2.2.5
+  - pytorch-forecasting=1.1.1
+  - optuna=3.6.1
+  - optuna-integration=3.6.0
+  - ta=0.11.0
+
+  # NLP
+  # transformers 5.x refuses to enable its PyTorch backend unless torch>=2.4,
+  # and this stack is on torch 2.2.2 for the lightning/pytorch-forecasting pin.
+  # 4.44.2 predates that cutoff and loads ProsusAI/finbert without a feature gap.
+  - transformers=4.44.2
+  # Required by stage 3: it calls from_pretrained(low_cpu_mem_usage=True), which
+  # raises ImportError without accelerate installed.
+  - accelerate=1.14.0
+
+  # Scraping (stage 0 only)
+  - requests
+  - aiohttp
+  - aiofiles
+  - beautifulsoup4
+  - lxml
+  - selenium
+  - yfinance
+  - python-dotenv
+
+  # curl_cffi has no conda package on any channel. It is the TLS-impersonation
+  # HTTP client used by the Moneycontrol and Business Standard scrapers, so it
+  # is only needed to re-scrape; the modelling stages never import it.
+  - pip:
+      - curl_cffi

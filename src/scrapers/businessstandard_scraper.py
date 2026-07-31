@@ -1,33 +1,21 @@
 #!/usr/bin/env python3
 """
-Business Standard — High-Performance Hybrid Scraper (with Resume)
-=================================================================
-Scrapes article data (date, title, news, url) from paginated listing pages
-on business-standard.com and streams results into a CSV file.
+Business Standard scraper.
 
-Hybrid Architecture
--------------------
-* curl_cffi   → listing page pagination (fast TLS-impersonated HTTP)
-* Selenium    → article page rendering  (JS execution for full content)
+Collects date, title, news and url from paginated listing pages on
+business-standard.com and streams the rows into a CSV.
 
-This solves the BS bot-protection (curl_cffi TLS impersonation) AND the
-JS-rendered content problem (Selenium headless Chrome) simultaneously.
+Listing pages are fetched with curl_cffi (TLS impersonation gets past the bot
+protection); article pages are rendered with headless Chrome because the body
+copy is injected by JavaScript. Articles are parsed from JSON-LD first, with an
+HTML fallback.
 
-The article scraping logic (JSON-LD + HTML fallback) is adopted from the
-proven, working bs.py scraper.
+A run resumes after a crash: a JSON checkpoint is written after every page
+(write-then-rename), and URLs already present in the CSV are loaded at startup
+so nothing is scraped twice.
 
-Crash-Resilient Resume System (3 Layers)
------------------------------------------
-1. Checkpoint File — JSON saved after every page (atomic write-then-rename)
-2. URL Dedup Set   — reads existing CSV URLs at startup → zero duplicates
-3. Atomic Writes   — checkpoint uses tmp→rename; CSV append with flush
-
-Usage
------
-    conda activate ml
-    pip install curl_cffi   # if not already installed
-    cd src/scrapers
-    python businessstandard_scraper.py
+    conda activate MarketFusion
+    python src/scrapers/businessstandard_scraper.py
 """
 
 from __future__ import annotations
@@ -55,9 +43,6 @@ from curl_cffi import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION
-# ═══════════════════════════════════════════════════════════════════════════════
 
 STOP_DATE: str = "2020-01-01"
 WEBSITE_NAME: str = "businessstandard"
@@ -66,25 +51,25 @@ SECTION_URLS: list[str] = [
     "https://www.business-standard.com/markets/news",
 ]
 
-# ── Concurrency ───────────────────────────────────────────────────────────────
+# Concurrency
 MAX_CONCURRENT_REQUESTS: int = 15       # curl_cffi semaphore for listing pages
 SELENIUM_WORKERS: int = 6              # headless Chrome instances for articles
 ARTICLES_PER_BATCH: int = 6            # matches Selenium pool size
 
-# ── Retry / backoff ───────────────────────────────────────────────────────────
+# Retry / backoff
 MAX_RETRIES: int = 3
 INITIAL_BACKOFF_S: float = 2.0
 BACKOFF_MULTIPLIER: float = 2.0
 BACKOFF_JITTER: float = 1.0
 
-# ── Delays ────────────────────────────────────────────────────────────────────
+# Delays
 PAGE_DELAY_S: float = 1.0
-ARTICLE_DELAY_S: float = 0.5           # from bs.py: time.sleep after driver.get
+ARTICLE_DELAY_S: float = 0.5           # sleep after driver.get
 
-# ── Timeout ───────────────────────────────────────────────────────────────────
+# Timeout
 REQUEST_TIMEOUT_S: int = 30
 
-# ── curl_cffi impersonation ───────────────────────────────────────────────────
+# curl_cffi impersonation
 IMPERSONATE_BROWSER = "chrome120"
 
 BASE_HEADERS: dict[str, str] = {
@@ -97,9 +82,6 @@ BASE_HEADERS: dict[str, str] = {
     "Sec-Fetch-User": "?1",
 }
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# LOGGING & PATHS
-# ═══════════════════════════════════════════════════════════════════════════════
 
 logging.basicConfig(
     level=logging.INFO,
@@ -115,9 +97,6 @@ OUTPUT_FILE = OUTPUT_DIR / f"{WEBSITE_NAME}_raw.csv"
 CHECKPOINT_DIR = OUTPUT_DIR / "checkpoint"
 CHECKPOINT_FILE = CHECKPOINT_DIR / f"{WEBSITE_NAME}_checkpoint.json"
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CHECKPOINT / RESUME SYSTEM
-# ═══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class Checkpoint:
@@ -181,10 +160,6 @@ def load_scraped_urls(csv_path: Path) -> set[str]:
     return urls
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# DATA STRUCTURES
-# ═══════════════════════════════════════════════════════════════════════════════
-
 @dataclass
 class Article:
     date: str
@@ -219,12 +194,8 @@ class ScraperStats:
         )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SELENIUM DRIVER POOL  (adopted from bs.py)
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def _setup_driver() -> webdriver.Chrome:
-    """Initializes a headless Chrome driver (from bs.py)."""
+    """Initializes a headless Chrome driver."""
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
@@ -248,7 +219,7 @@ def _setup_driver() -> webdriver.Chrome:
 
 
 class SeleniumPool:
-    """Thread-safe pool of headless Chrome instances (from bs.py pattern)."""
+    """Thread-safe pool of headless Chrome instances."""
 
     def __init__(self, size: int):
         self._size = size
@@ -278,12 +249,8 @@ class SeleniumPool:
         log.info("  Chrome browsers shut down")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ARTICLE SCRAPING  (adopted from bs.py — the proven working logic)
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def _scrape_article_with_selenium(driver: webdriver.Chrome, url: str) -> Optional[dict]:
-    """Scrape a single article using Selenium. Directly from bs.py logic."""
+    """Scrape a single article using Selenium."""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             driver.get(url)
@@ -294,7 +261,7 @@ def _scrape_article_with_selenium(driver: webdriver.Chrome, url: str) -> Optiona
             date_val = ""
             news = ""
 
-            # ── Method 1: JSON-LD (from bs.py — very resilient) ───────────
+            # Method 1: JSON-LD (very resilient)
             for script in soup.find_all("script", type="application/ld+json"):
                 try:
                     data = json.loads(script.string, strict=False)
@@ -314,7 +281,7 @@ def _scrape_article_with_selenium(driver: webdriver.Chrome, url: str) -> Optiona
                 except Exception:
                     pass
 
-            # ── Method 2: HTML Parsing Fallback (from bs.py) ──────────────
+            # Method 2: HTML parsing fallback
             if not title:
                 title_tag = soup.find("h1")
                 title = title_tag.text.strip() if title_tag else (
@@ -352,7 +319,7 @@ def _scrape_article_with_selenium(driver: webdriver.Chrome, url: str) -> Optiona
 
 
 def _parse_date(date_str: str) -> str:
-    """Parse ISO-8601 date string → YYYY-MM-DD (from bs.py)."""
+    """Parse ISO-8601 date string -> YYYY-MM-DD."""
     if not date_str:
         return ""
     try:
@@ -363,10 +330,6 @@ def _parse_date(date_str: str) -> str:
     except Exception:
         return ""
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# LISTING PAGE PARSING  (curl_cffi — fast, no JS needed)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def _parse_listing_page(html: str, base_url: str) -> list[str]:
     """Extract article URLs from the MAIN content area only.
@@ -406,10 +369,6 @@ def _parse_listing_page(html: str, base_url: str) -> list[str]:
 
     return urls
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ASYNC LISTING PAGE FETCHER  (curl_cffi)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class AsyncListingFetcher:
     """curl_cffi fetcher for listing pages only (fast, no JS needed)."""
@@ -478,10 +437,6 @@ class AsyncListingFetcher:
         return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CSV WRITER
-# ═══════════════════════════════════════════════════════════════════════════════
-
 class CSVWriter:
     def __init__(self, filepath: Path):
         self._path = filepath
@@ -510,10 +465,6 @@ class CSVWriter:
         if self._file:
             self._file.close()
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN SCRAPER ENGINE
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class BusinessStandardScraper:
     def __init__(self):
@@ -550,11 +501,11 @@ class BusinessStandardScraper:
         else:
             log.info("  ☐ Fresh run (no checkpoint found)")
 
-        # ── Initialize Selenium pool ──────────────────────────────────────
+        # Initialize Selenium pool
         selenium_pool = SeleniumPool(SELENIUM_WORKERS)
         selenium_pool.start()
 
-        # ── ThreadPoolExecutor for Selenium calls ─────────────────────────
+        # ThreadPoolExecutor for Selenium calls
         thread_pool = ThreadPoolExecutor(max_workers=SELENIUM_WORKERS)
 
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
@@ -706,10 +657,10 @@ class BusinessStandardScraper:
         thread_pool: ThreadPoolExecutor,
         loop: asyncio.AbstractEventLoop,
     ) -> bool:
-        """Scrape articles using Selenium thread pool (like bs.py).
+        """Scrape articles using the Selenium thread pool.
 
         Returns True only if the MAJORITY (>60%) of dated articles on this
-        page are before STOP_DATE — prevents premature stopping caused by
+        page are before STOP_DATE - prevents premature stopping caused by
         a stale sidebar link or a single re-published article.
         """
         total_dated = 0
@@ -795,10 +746,6 @@ class BusinessStandardScraper:
             return None
         return Article(**parsed)
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
     log.info("Business Standard Hybrid Scraper (curl_cffi + Selenium)")

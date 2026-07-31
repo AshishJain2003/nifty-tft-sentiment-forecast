@@ -2,73 +2,55 @@
 """
 TFT pipeline for Nifty50 multi-series forecasting.
 
+Covers Optuna hyperparameter search, training with resume support, and test-set
+evaluation for each encoder window, driven from an interactive menu:
 
-Sections
---------
-1. Imports  (stdlib → third-party)
+  [0] tuning, then training/testing
+  [1] training/testing only (loads tuned hyperparameters when available)
+  [2] inference only
+  [3] exit
 
-2. SHARED CONSTANTS & UTILITIES
-   Date/column names, split boundaries, batch-size map, metric column list.
-   configure_logging, configure_warnings, set_seed, ensure_dir, parse_windows,
-   choose_windows_menu, now_utc_iso, read_json, write_json,
-   find_latest_checkpoint, to_numpy, safe_div, compute_regression_metrics,
-   compute_mape, compute_direction_metrics, load_and_prepare_dataframe,
-   get_split_masks, choose_model_features, filter_eligible_symbols,
-   build_datasets_for_window, unpack_prediction_output, find_symbol_col,
-   find_time_col, build_truth_and_price_matrices.
-
-3. TRAINING & TESTING
-   WindowStateCallback, RunConfig, compute_window_metrics,
-   save_prediction_audit, evaluate_window_and_write_outputs,
-   run_window_training.
-
-4. HYPERPARAMETER TUNING
-   TuneConfig, pick_precision_sequence, pick_loader_workers, is_probable_oom,
-   is_probable_bf16_issue, compute_per_symbol_equal_direction_metrics,
-   WindowObjective, export_trials_csv, print_window_summary, tune_window.
-
-5. UNIFIED CONFIG
-   UnifiedConfig dataclass merging all RunConfig and TuneConfig fields.
-   make_run_config (builds RunConfig with optional per-window HP overrides),
-   make_tune_config, load_tuned_hps_for_window.
-
-6. CLI & MAIN
-   build_arg_parser, make_unified_config, show_main_menu,
-   run_tuning_mode, run_train_test_mode, run_inference_only_mode, main.
-   if __name__ == "__main__": main()
-
-Interactive top-level menu
---------------------------
-  [0] Hyperparameter tuning  → then training/testing
-  [1] Training/testing only  (loads tuned HPs when available)
-  [2] Inference only
-  [3] Exit
+Checkpoint selection is deliberately split: resuming training wants the newest
+file, evaluating wants the best val_loss.
 """
 
 from __future__ import annotations
 
-# ── stdlib ──────────────────────────────────────────────────────────────────
+# stdlib
 import argparse
 import gc
 import json
 import logging
 import os
 import random
+import re
 import signal
 import sys
 import traceback
 import warnings
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-# ── third-party ──────────────────────────────────────────────────────────────
+# Must be set before torch/OpenMP load: the OpenMP runtime reads
+# OMP_NUM_THREADS at library init.
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+os.environ.setdefault("MKL_NUM_THREADS", "4")
+os.environ.setdefault("MALLOC_TRIM_THRESHOLD_", "100000")
+
+# third-party
 import numpy as np
 import pandas as pd
 import torch
 from sklearn.metrics import f1_score, precision_score, recall_score
-from tqdm.auto import tqdm
+
+# Must be registered before `lightning` is imported: lightning.fabric calls
+# `pkg_resources.declare_namespace()` at import time, so the warning fires
+# while this import statement runs.
+warnings.filterwarnings("ignore", message=r".*pkg_resources is deprecated as an API.*")
+warnings.filterwarnings("ignore", message=r".*declare_namespace\(.*\) is deprecated.*")
 
 try:
     import lightning.pytorch as pl
@@ -82,7 +64,7 @@ try:
 except ImportError as exc:
     raise ImportError(
         "Missing dependency: lightning. "
-        "Install in your conda env (ml/ml2), e.g. `pip install lightning==2.6.1`."
+        "Create the pinned environment with `conda env create -f environment.yml`."
     ) from exc
 
 try:
@@ -92,7 +74,7 @@ try:
 except ImportError as exc:
     raise ImportError(
         "Missing dependency: pytorch-forecasting. "
-        "Install in your conda env, e.g. `pip install pytorch-forecasting==1.7.0`."
+        "Create the pinned environment with `conda env create -f environment.yml`."
     ) from exc
 
 try:
@@ -116,15 +98,14 @@ except Exception:
         ) from exc
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 2 — SHARED CONSTANTS & UTILITIES
-# ══════════════════════════════════════════════════════════════════════════════
-
 DATE_COL = "Date"
 SYMBOL_COL = "Symbol"
 TIME_IDX_COL = "time_idx"
 TARGET_COL = "target_pct_change"
+# Canonical price column used for price-space evaluation. `load_and_prepare_dataframe`
+# repoints it at the unscaled rupee column when the dataset carries one.
 PRICE_COL = "Adj Close"
+PRICE_INR_COL = "adj_close_inr"
 
 TRAIN_END = "2024-12-31"
 VAL_START = "2025-01-01"
@@ -141,7 +122,8 @@ DEFAULT_TUNE_ARTIFACT_ROOT = Path("artifacts/tft_tune")
 # Drop raw OHLCV from model features (keep Adj Close in the original dataframe
 # for price-space evaluation).
 RAW_FEATURE_DROP = {
-    "Open", "High", "Low", "Close", "Adj Close", "Volume", "symbol_base", DATE_COL
+    "Open", "High", "Low", "Close", "Adj Close", "Volume", "symbol_base",
+    PRICE_INR_COL, DATE_COL,
 }
 
 # Calendar known covariates
@@ -164,7 +146,7 @@ FINAL_METRIC_COLUMNS = [
 ]
 
 
-# ── Logging / warnings / seeding ─────────────────────────────────────────────
+# Logging / warnings / seeding
 
 def configure_logging() -> None:
     logging.basicConfig(
@@ -172,9 +154,14 @@ def configure_logging() -> None:
         format="%(asctime)s | %(levelname)-7s | %(message)s",
         datefmt="%H:%M:%S",
     )
-    # Suppress noisy Lightning info lines (hardware availability, LOCAL_RANK, …)
-    for noisy_logger in ("lightning", "lightning.pytorch", "pytorch_lightning"):
-        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+    # Suppress noisy Lightning info lines. Naming only the top-level packages
+    # is not enough: Lightning sets an explicit level on several submodules,
+    # and a child level overrides the parent, so walk the registry.
+    for name in ("lightning", "pytorch_lightning", "lightning_fabric"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+    for name in list(logging.root.manager.loggerDict):
+        if name.split(".")[0] in ("lightning", "pytorch_lightning", "lightning_fabric"):
+            logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def configure_warnings() -> None:
@@ -195,6 +182,18 @@ def configure_warnings() -> None:
         "ignore",
         message=r"Starting from v1\.9\.0, `tensorboardX` has been removed as a dependency of the `lightning\.pytorch` package.*",
     )
+    # pytorch-forecasting 1.1.x emits this before inspecting the kwarg. Both
+    # model constructions here pass optimizer="adam" explicitly.
+    warnings.filterwarnings(
+        "ignore",
+        message=r"In pytorch-forecasting models, on versions 1\.1\.X, the default optimizer defaults.*",
+    )
+    # Emitted once per DataLoader when num_workers is below the CPU count.
+    # pick_loader_workers() caps workers on purpose.
+    warnings.filterwarnings(
+        "ignore",
+        message=r"The '(train|val|test)_dataloader' does not have many workers which may be a bottleneck.*",
+    )
 
 
 def set_seed(seed: int) -> None:
@@ -202,6 +201,9 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    # `seed_everything` has no verbosity switch in lightning 2.2.x; its
+    # "Seed set to N" line is silenced by the logger levels in
+    # configure_logging().
     pl.seed_everything(seed, workers=True)
 
 
@@ -228,7 +230,7 @@ def shutdown_dataloader_workers(loader) -> None:
         pass
 
 
-# ── Path / JSON helpers ───────────────────────────────────────────────────────
+# Path / JSON helpers
 
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
@@ -300,7 +302,87 @@ def choose_windows_menu(default_windows: Sequence[int]) -> List[int]:
 
 
 def now_utc_iso() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    # datetime.utcnow() is deprecated from 3.12 and returns a naive datetime.
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def library_versions() -> Dict[str, str]:
+    import sklearn
+
+    return {
+        "python": sys.version.split()[0],
+        "torch": torch.__version__,
+        "cuda": str(torch.version.cuda),
+        "lightning": getattr(pl, "__version__", "unknown"),
+        "pytorch_forecasting": getattr(
+            __import__("pytorch_forecasting"), "__version__", "unknown"
+        ),
+        "optuna": optuna.__version__,
+        "numpy": np.__version__,
+        "pandas": pd.__version__,
+        "scikit_learn": sklearn.__version__,
+    }
+
+
+def git_revision() -> str:
+    """Short git SHA of the working tree, or '' outside a repo."""
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=Path(__file__).resolve().parent,
+        )
+        rev = out.stdout.strip()
+        if out.returncode == 0 and rev:
+            dirty = subprocess.run(
+                ["git", "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                cwd=Path(__file__).resolve().parent,
+            ).stdout.strip()
+            return f"{rev}-dirty" if dirty else rev
+    except Exception:
+        pass
+    return ""
+
+
+def dataset_fingerprint(data_path: Path) -> Dict[str, object]:
+    """Cheap identity for the training table so results stay traceable."""
+    try:
+        stat = data_path.stat()
+        return {
+            "path": str(data_path),
+            "size_bytes": int(stat.st_size),
+            "modified_at": datetime.fromtimestamp(
+                stat.st_mtime, timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+    except OSError:
+        return {"path": str(data_path)}
+
+
+def describe_device() -> Dict[str, object]:
+    if not torch.cuda.is_available():
+        return {"type": "cpu", "cpu_count": os.cpu_count()}
+    props = torch.cuda.get_device_properties(0)
+    return {
+        "type": "cuda",
+        "name": props.name,
+        "total_vram_gb": round(props.total_memory / 1024**3, 2),
+        "capability": f"{props.major}.{props.minor}",
+        "bf16_supported": bool(torch.cuda.is_bf16_supported()),
+        "cpu_count": os.cpu_count(),
+    }
+
+
+def lstm_layers_for_window(window: int) -> int:
+    """Depth rule shared by the tuner and the trainer."""
+    return 1 if window <= 10 else 2
 
 
 def read_json(path: Path) -> Dict:
@@ -318,7 +400,16 @@ def write_json(path: Path, payload: Dict) -> None:
     tmp.replace(path)
 
 
+def merge_json(path: Path, updates: Dict) -> Dict:
+    """Read-modify-write so a later stage cannot erase earlier provenance."""
+    payload = read_json(path)
+    payload.update(updates)
+    write_json(path, payload)
+    return payload
+
+
 def find_latest_checkpoint(checkpoint_dir: Path) -> Optional[Path]:
+    """Newest checkpoint by mtime - the right choice for resuming training."""
     if not checkpoint_dir.exists():
         return None
     candidates = [p for p in checkpoint_dir.glob("*.ckpt") if p.is_file()]
@@ -328,7 +419,49 @@ def find_latest_checkpoint(checkpoint_dir: Path) -> Optional[Path]:
     return candidates[0]
 
 
-# ── Array helpers ─────────────────────────────────────────────────────────────
+def find_best_checkpoint(checkpoint_dir: Path) -> Optional[Path]:
+    """Best-val-loss checkpoint - the right choice for evaluating.
+
+    Falls back to the newest file only when no ``best-*`` checkpoint exists.
+    """
+    if not checkpoint_dir.exists():
+        return None
+    best = [p for p in checkpoint_dir.glob("best-*.ckpt") if p.is_file()]
+    if best:
+        # Filenames embed val_loss ("best-epoch004-valloss0.007137.ckpt"), so
+        # parse it and let the lowest loss win regardless of write order.
+        def parsed_loss(p: Path) -> Tuple[float, float]:
+            m = re.search(r"valloss([0-9]*\.?[0-9]+)", p.name)
+            return (float(m.group(1)) if m else float("inf"), -p.stat().st_mtime)
+
+        best.sort(key=parsed_loss)
+        return best[0]
+    return find_latest_checkpoint(checkpoint_dir)
+
+
+def resolve_checkpoint(raw: str, checkpoint_dir: Path) -> Optional[Path]:
+    """Resolve a recorded checkpoint path, tolerating a moved project tree.
+
+    ``state.json`` stores absolute paths, so moving the repo makes every
+    recorded path dangle. Fall back to the same filename inside the current
+    checkpoint directory before giving up.
+    """
+    if raw:
+        candidate = Path(raw)
+        if candidate.exists():
+            return candidate
+        relocated = checkpoint_dir / candidate.name
+        if relocated.exists():
+            logging.warning(
+                "Recorded checkpoint %s is missing; using relocated copy %s",
+                raw,
+                relocated,
+            )
+            return relocated
+    return None
+
+
+# Array helpers
 
 def to_numpy(x) -> np.ndarray:
     if torch.is_tensor(x):
@@ -374,7 +507,7 @@ def compute_direction_metrics(
     }
 
 
-# ── Data preparation ──────────────────────────────────────────────────────────
+# Data preparation
 
 def load_and_prepare_dataframe(data_path: Path) -> pd.DataFrame:
     df = pd.read_csv(data_path)
@@ -394,6 +527,21 @@ def load_and_prepare_dataframe(data_path: Path) -> pd.DataFrame:
 
     df[TIME_IDX_COL] = df[TIME_IDX_COL].astype(np.int64)
     df = df.sort_values([SYMBOL_COL, DATE_COL], kind="mergesort").reset_index(drop=True)
+
+    # Feature engineering standardizes every price column per symbol, so
+    # `Adj Close` here is a z-score and price-space audit columns built from it
+    # are unreadable. Prefer the unscaled rupee column when present. MAPE is
+    # unaffected either way, since the shared base price cancels in the ratio.
+    if PRICE_INR_COL in df.columns:
+        df[PRICE_COL] = df[PRICE_INR_COL].astype(np.float64)
+    else:
+        logging.warning(
+            "%s not found in %s — price-space outputs will be in standardized units. "
+            "Re-run src/3_feature_engineering.py to regenerate the dataset with real "
+            "rupee prices.",
+            PRICE_INR_COL,
+            data_path,
+        )
 
     # Add known calendar features as categoricals for TFT embeddings.
     df["dow"] = df[DATE_COL].dt.weekday.astype(np.int16).astype(str)
@@ -550,7 +698,7 @@ def build_datasets_for_window(
     return training, validation, test, work_df
 
 
-# ── Prediction helpers ────────────────────────────────────────────────────────
+# Prediction helpers
 
 def unpack_prediction_output(
     pred_output,
@@ -658,7 +806,6 @@ def build_truth_and_price_matrices(
         n = m
 
     lookup_target = base_df.set_index([SYMBOL_COL, TIME_IDX_COL])[TARGET_COL].to_dict()
-    lookup_price = base_df.set_index([SYMBOL_COL, TIME_IDX_COL])[PRICE_COL].to_dict()
     lookup_date = (
         base_df.drop_duplicates(TIME_IDX_COL)
         .set_index(TIME_IDX_COL)[DATE_COL]
@@ -674,15 +821,32 @@ def build_truth_and_price_matrices(
         ]
         true_returns[:, h] = np.asarray(vals, dtype=np.float64)
 
-    # Use the encoder end price (time_idx - 1) as base for strict no-lookahead
-    # price reconstruction.
-    base_prices = np.asarray(
-        [
-            lookup_price.get((sym, int(t) - 1), np.nan)
-            for sym, t in zip(symbols, start_idx)
-        ],
-        dtype=np.float64,
+    # Base price = the most recent observation strictly before the decoder
+    # start, which keeps reconstruction free of lookahead. An exact
+    # `time_idx - 1` lookup is not enough, because the datasets allow missing
+    # timesteps and some symbols have real gaps in the trading timeline.
+    base_prices = np.full(len(symbols), np.nan, dtype=np.float64)
+    price_frame = base_df[[SYMBOL_COL, TIME_IDX_COL, PRICE_COL]].sort_values(
+        [SYMBOL_COL, TIME_IDX_COL], kind="mergesort"
     )
+    for sym, group in price_frame.groupby(SYMBOL_COL, sort=False):
+        rows = np.flatnonzero(symbols == str(sym))
+        if rows.size == 0:
+            continue
+        known_idx = group[TIME_IDX_COL].to_numpy(dtype=np.int64)
+        known_price = group[PRICE_COL].to_numpy(dtype=np.float64)
+        # side="left" - 1 => last observation strictly earlier than the decoder start.
+        pos = np.searchsorted(known_idx, start_idx[rows], side="left") - 1
+        found = pos >= 0
+        base_prices[rows[found]] = known_price[pos[found]]
+
+    missing_base = int(np.count_nonzero(~np.isfinite(base_prices)))
+    if missing_base:
+        logging.warning(
+            "%s prediction row(s) have no prior price and cannot be expressed in "
+            "price space; they are excluded from MAPE.",
+            missing_base,
+        )
     pred_prices = base_prices[:, None] * np.cumprod(1.0 + pred_returns, axis=1)
     true_prices = base_prices[:, None] * np.cumprod(1.0 + true_returns, axis=1)
 
@@ -691,10 +855,6 @@ def build_truth_and_price_matrices(
     )
     return symbols, start_idx, start_dates, true_returns, pred_prices, true_prices
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 3 — TRAINING & TESTING
-# ══════════════════════════════════════════════════════════════════════════════
 
 class WindowStateCallback(Callback):
     """Lightning callback that writes crash-safe state JSON after every epoch."""
@@ -912,7 +1072,7 @@ def evaluate_window_and_write_outputs(
         true_prices=true_prices,
     )
 
-    write_json(
+    merge_json(
         state_path,
         {
             "window": window,
@@ -936,6 +1096,10 @@ def run_window_training(
     metrics_rows: List[Dict],
 ) -> None:
     log = logging.getLogger(__name__)
+
+    # Re-seed per window, so a window's result does not depend on how many
+    # windows ran before it and a resumed run reproduces a fresh one.
+    set_seed(cfg.seed + window)
 
     window_dir = cfg.artifact_root / f"window_{window}"
     checkpoints_dir = window_dir / "checkpoints"
@@ -1018,25 +1182,31 @@ def run_window_training(
     )
 
     batch_size = WINDOW_BATCH_SIZE.get(window, 64)
-    test_loader = test_ds.to_dataloader(
-        train=False,
-        batch_size=batch_size,
-        num_workers=cfg.num_workers,
-        persistent_workers=cfg.num_workers > 0,
-        pin_memory=torch.cuda.is_available(),
-    )
+    train_workers, eval_workers = pick_loader_workers(cfg.num_workers)
+
+    def make_test_loader():
+        # Built on demand: spawning eval workers before fit() keeps them idle,
+        # each holding a copy of the dataset, for the whole training run.
+        return test_ds.to_dataloader(
+            train=False,
+            batch_size=batch_size,
+            num_workers=eval_workers,
+            persistent_workers=False,
+            pin_memory=torch.cuda.is_available(),
+        )
 
     if metrics_only_recompute and not cfg.force_retrain:
         eval_ckpt = None
         for ckpt_key in ("best_ckpt", "last_ckpt"):
-            ck = state.get(ckpt_key)
-            if ck and Path(ck).exists():
-                eval_ckpt = str(Path(ck))
+            resolved = resolve_checkpoint(state.get(ckpt_key, ""), checkpoints_dir)
+            if resolved is not None:
+                eval_ckpt = str(resolved)
                 break
         if eval_ckpt is None:
-            latest = find_latest_checkpoint(checkpoints_dir)
-            if latest is not None:
-                eval_ckpt = str(latest)
+            # Evaluation must fall back to the best epoch, not the newest file.
+            best = find_best_checkpoint(checkpoints_dir)
+            if best is not None:
+                eval_ckpt = str(best)
 
         if eval_ckpt is not None:
             log.info(
@@ -1048,7 +1218,7 @@ def run_window_training(
                 window=window,
                 prediction_length=cfg.prediction_length,
                 work_df=work_df,
-                test_loader=test_loader,
+                test_loader=make_test_loader(),
                 best_ckpt=eval_ckpt,
                 window_dir=window_dir,
                 metrics_path=metrics_path,
@@ -1063,18 +1233,20 @@ def run_window_training(
             window,
         )
 
+    # Same worker policy the tuner uses: cfg.num_workers is a budget across all
+    # loaders, not a per-loader count.
     train_loader = training_ds.to_dataloader(
         train=True,
         batch_size=batch_size,
-        num_workers=cfg.num_workers,
-        persistent_workers=cfg.num_workers > 0,
+        num_workers=train_workers,
+        persistent_workers=train_workers > 0,
         pin_memory=torch.cuda.is_available(),
     )
     val_loader = val_ds.to_dataloader(
         train=False,
         batch_size=batch_size,
-        num_workers=cfg.num_workers,
-        persistent_workers=cfg.num_workers > 0,
+        num_workers=eval_workers,
+        persistent_workers=eval_workers > 0,
         pin_memory=torch.cuda.is_available(),
     )
 
@@ -1099,7 +1271,10 @@ def run_window_training(
         dirpath=str(checkpoints_dir),
         filename="step-{step:09d}",
         monitor=None,
-        save_top_k=-1,
+        # Periodic checkpoints exist only so a crash mid-epoch can resume; the
+        # best-epoch model is tracked by best_ckpt_cb above. save_top_k must be
+        # one of {-1, 0, 1} when monitor=None, and -1 would keep every one.
+        save_top_k=1,
         every_n_train_steps=1000,
         save_on_train_epoch_end=False,
         auto_insert_metric_name=False,
@@ -1111,10 +1286,13 @@ def run_window_training(
 
     csv_logger = CSVLogger(save_dir=str(logs_dir), name="lightning")
 
+    # Same precision policy as the tuner.
+    precision = pick_precision_sequence()[0]
+
     trainer = pl.Trainer(
         accelerator="auto",
         devices=1,
-        precision="16-mixed",
+        precision=precision,
         max_epochs=cfg.max_epochs,
         logger=csv_logger,
         callbacks=[early_stop, best_ckpt_cb, step_ckpt_cb, state_cb, progress_cb],
@@ -1138,8 +1316,14 @@ def run_window_training(
         dropout=cfg.dropout,
         loss=QuantileLoss(),
         output_size=7,
-        # FP16-safe attention mask bias; default can overflow in 16-mixed on some GPUs.
-        mask_bias=-1e4,
+        # Pinned: on pytorch-forecasting 1.1.x the default optimizer is 'adam'
+        # only when `pytorch_optimizer` is absent and becomes 'ranger' when it
+        # is installed, which makes the optimizer a property of the environment.
+        optimizer="adam",
+        # No `mask_bias` here: pytorch-forecasting has no such parameter and
+        # `from_dataset` forwards unknown kwargs into `BaseModel.__init__`,
+        # which raises TypeError. The library hardcodes -1e9 as the mask bias,
+        # which is safe under both precisions this pipeline uses.
         log_interval=-1,
         log_val_interval=-1,
         reduce_on_plateau_patience=4,
@@ -1147,15 +1331,61 @@ def run_window_training(
 
     resume_ckpt = None
     if not cfg.force_retrain:
-        state_ckpt = state.get("last_ckpt")
-        if state_ckpt and Path(state_ckpt).exists():
-            resume_ckpt = str(Path(state_ckpt))
+        resolved = resolve_checkpoint(state.get("last_ckpt", ""), checkpoints_dir)
+        if resolved is not None:
+            resume_ckpt = str(resolved)
         else:
+            # Resuming genuinely wants the newest file, not the best one.
             latest = find_latest_checkpoint(checkpoints_dir)
             if latest is not None:
                 resume_ckpt = str(latest)
 
+    # Full provenance for this window: exactly which HPs, precision, batch size,
+    # library versions and data produced the metrics written alongside it.
     write_json(
+        window_dir / "run_manifest.json",
+        {
+            "window": window,
+            "created_at": now_utc_iso(),
+            "git_revision": git_revision(),
+            "device": describe_device(),
+            "library_versions": library_versions(),
+            "dataset": dataset_fingerprint(cfg.data_path),
+            "precision": precision,
+            "batch_size": batch_size,
+            "effective_batch_size": batch_size * cfg.accumulate_grad_batches,
+            "seed": cfg.seed + window,
+            "deterministic": False,
+            "hyperparameters": {
+                "learning_rate": cfg.learning_rate,
+                "hidden_size": cfg.hidden_size,
+                "hidden_continuous_size": cfg.hidden_continuous_size,
+                "attention_head_size": cfg.attention_head_size,
+                "lstm_layers": cfg.lstm_layers,
+                "dropout": cfg.dropout,
+                "gradient_clip_val": cfg.gradient_clip_val,
+                # Recorded because pytorch-forecasting's own default is
+                # environment-dependent.
+                "optimizer": "adam",
+            },
+            "trainer": {
+                "max_epochs": cfg.max_epochs,
+                "patience": cfg.patience,
+                "accumulate_grad_batches": cfg.accumulate_grad_batches,
+                "limit_val_batches": cfg.limit_val_batches,
+                "prediction_length": cfg.prediction_length,
+                "encoder_length": window,
+                # Recorded because it changes results, not just speed:
+                # seed_everything(workers=True) seeds each worker from the
+                # worker count, so a different count reorders batches and moves
+                # the optimisation trajectory.
+                "train_dataloader_workers": train_workers,
+                "eval_dataloader_workers": eval_workers,
+            },
+        },
+    )
+
+    merge_json(
         state_path,
         {
             "window": window,
@@ -1205,7 +1435,7 @@ def run_window_training(
             )
     except KeyboardInterrupt:
         latest = find_latest_checkpoint(checkpoints_dir)
-        write_json(
+        merge_json(
             state_path,
             {
                 "window": window,
@@ -1220,7 +1450,7 @@ def run_window_training(
         raise
     except Exception as exc:
         latest = find_latest_checkpoint(checkpoints_dir)
-        write_json(
+        merge_json(
             state_path,
             {
                 "window": window,
@@ -1237,14 +1467,14 @@ def run_window_training(
 
     best_ckpt = best_ckpt_cb.best_model_path
     if not best_ckpt:
-        latest = find_latest_checkpoint(checkpoints_dir)
-        if latest is None:
+        fallback = find_best_checkpoint(checkpoints_dir)
+        if fallback is None:
             raise RuntimeError(
                 f"window={window}: no checkpoint found after training."
             )
-        best_ckpt = str(latest)
+        best_ckpt = str(fallback)
 
-    write_json(
+    merge_json(
         state_path,
         {
             "window": window,
@@ -1259,11 +1489,15 @@ def run_window_training(
         },
     )
 
+    # Release the training workers before evaluation spawns its own.
+    shutdown_dataloader_workers(train_loader)
+    shutdown_dataloader_workers(val_loader)
+
     evaluate_window_and_write_outputs(
         window=window,
         prediction_length=cfg.prediction_length,
         work_df=work_df,
-        test_loader=test_loader,
+        test_loader=make_test_loader(),
         best_ckpt=best_ckpt,
         window_dir=window_dir,
         metrics_path=metrics_path,
@@ -1271,10 +1505,6 @@ def run_window_training(
         state_path=state_path,
     )
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 4 — HYPERPARAMETER TUNING
-# ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class TuneConfig:
@@ -1293,16 +1523,23 @@ class TuneConfig:
     accumulate_grad_batches: int
     limit_val_batches: int
     eval_test_metrics: bool
+    keep_trial_checkpoints: bool
 
 
 def pick_precision_sequence() -> List[str]:
+    """Ordered precision attempts; later entries are fallbacks.
+
+    bf16 is preferred on Ampere and newer (RTX 3050 is sm_86): it has the same
+    dynamic range as fp32, so it needs no loss scaling and represents the
+    ``-1e9`` attention mask bias that pytorch-forecasting hardcodes exactly.
+    Under the 16-mixed fallback that value saturates to -inf, which softmax
+    still resolves to zero attention on masked positions.
     """
-    Prefer 16-mixed on CUDA for RTX 3050-class GPUs.
-    Keep a deterministic order so effective precision is recorded per trial.
-    """
-    if torch.cuda.is_available():
-        return ["16-mixed"]
-    return ["32-true"]
+    if not torch.cuda.is_available():
+        return ["32-true"]
+    if torch.cuda.is_bf16_supported():
+        return ["bf16-mixed", "16-mixed"]
+    return ["16-mixed"]
 
 
 def pick_loader_workers(requested_workers: int) -> Tuple[int, int]:
@@ -1311,7 +1548,8 @@ def pick_loader_workers(requested_workers: int) -> Tuple[int, int]:
     If requested_workers < 0, auto-tune based on host CPU.
     """
     if requested_workers < 0:
-        train_workers = 4
+        # Leave headroom for the main process and the GPU feeder thread.
+        train_workers = max(0, min(4, (os.cpu_count() or 2) // 2 - 1))
     else:
         train_workers = max(0, int(requested_workers))
     eval_workers = max(0, train_workers // 2)
@@ -1324,9 +1562,14 @@ def is_probable_oom(exc: BaseException) -> bool:
 
 
 def is_probable_bf16_issue(exc: BaseException) -> bool:
+    """Whether an exception looks precision-related enough to retry in fp16.
+
+    Matching is anchored on word boundaries: a plain substring test for "amp"
+    fires on "clamp", "example" and "sample", which appear in unrelated tensor
+    errors and would burn a second full training attempt per trial.
+    """
     msg = str(exc).lower()
-    keywords = ["bf16", "bfloat16", "bfloat", "unsupported", "amp"]
-    return any(k in msg for k in keywords)
+    return re.search(r"\b(bf16|bfloat16|bfloat|amp|autocast|unsupported)\b", msg) is not None
 
 
 def compute_per_symbol_equal_direction_metrics(
@@ -1394,6 +1637,10 @@ class WindowObjective:
         self.window_dir = window_dir
 
     def __call__(self, trial: optuna.trial.Trial) -> float:
+        # Seed per trial so a resumed study reproduces a fresh one. Under a
+        # single global seed, trial N depends on how many trials preceded it.
+        set_seed(self.cfg.seed + self.window * 1000 + trial.number)
+
         batch_size = WINDOW_BATCH_SIZE.get(self.window, 64)
         train_workers, eval_workers = pick_loader_workers(self.cfg.num_workers)
         train_loader_kwargs: Dict = {
@@ -1419,7 +1666,7 @@ class WindowObjective:
             eval_loader_kwargs["prefetch_factor"] = 2
             eval_loader_kwargs["multiprocessing_context"] = "fork"
 
-        # ── Search space ────────────────────────────────────────────────────
+        # Search space
         learning_rate = trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)
         hidden_size = trial.suggest_categorical("hidden_size_v2", [16, 32, 48])
         hidden_continuous_size_raw = trial.suggest_categorical(
@@ -1498,7 +1745,6 @@ class WindowObjective:
             auto_insert_metric_name=False,
         )
         prune_cb = PyTorchLightningPruningCallback(trial, monitor="val_loss")
-        progress_cb = TQDMProgressBar(refresh_rate=50)
 
         precision_attempts = pick_precision_sequence()
         last_exc: Optional[BaseException] = None
@@ -1519,11 +1765,15 @@ class WindowObjective:
                     hidden_size=hidden_size,
                     attention_head_size=attention_head_size,
                     hidden_continuous_size=hidden_continuous_size,
-                    lstm_layers=1 if self.window <= 10 else 2,
+                    lstm_layers=lstm_layers_for_window(self.window),
                     dropout=dropout,
                     loss=QuantileLoss(),
                     output_size=7,
-                    mask_bias=-1e4,
+                    # Must match run_window_training: searching under a different
+                    # optimizer would tune hyperparameters for the wrong model.
+                    optimizer="adam",
+                    # See the note in run_window_training: `mask_bias` is not a
+                    # pytorch-forecasting parameter and raises TypeError.
                     log_interval=-1,
                     log_val_interval=-1,
                     reduce_on_plateau_patience=2,
@@ -1535,13 +1785,17 @@ class WindowObjective:
                     precision=precision,
                     max_epochs=self.cfg.max_epochs,
                     logger=False,
-                    callbacks=[early_stop, best_ckpt_cb, prune_cb, progress_cb],
+                    callbacks=[early_stop, best_ckpt_cb, prune_cb],
                     gradient_clip_val=gradient_clip_val,
                     accumulate_grad_batches=self.cfg.accumulate_grad_batches,
                     limit_val_batches=self.cfg.limit_val_batches,
                     deterministic=False,
                     benchmark=True,
                     enable_model_summary=False,
+                    # Optuna already renders a study-level bar. Lightning's
+                    # per-epoch bar underneath it means two writers competing
+                    # for the same terminal line.
+                    enable_progress_bar=False,
                     log_every_n_steps=100,
                     num_sanity_val_steps=0,
                     enable_checkpointing=True,
@@ -1664,6 +1918,41 @@ class WindowObjective:
             _cleanup_trial_loaders()
 
 
+def prune_trial_checkpoints(window_dir: Path, keep_trial: Optional[int]) -> int:
+    """Delete checkpoints for every trial except the study's best.
+
+    Nothing reads them back - training re-fits from scratch using only the best
+    hyperparameters from ``best_trial.json``. Returns bytes reclaimed.
+    """
+    trials_root = window_dir / "trials"
+    if not trials_root.exists():
+        return 0
+
+    keep_dir = (
+        trials_root / f"trial_{keep_trial:05d}" if keep_trial is not None else None
+    )
+    reclaimed = 0
+    for trial_dir in trials_root.glob("trial_*"):
+        if keep_dir is not None and trial_dir == keep_dir:
+            continue
+        ckpt_dir = trial_dir / "checkpoints"
+        if not ckpt_dir.exists():
+            continue
+        for ckpt in ckpt_dir.glob("*.ckpt"):
+            try:
+                reclaimed += ckpt.stat().st_size
+                ckpt.unlink()
+            except OSError:
+                pass
+        try:
+            # Remove the now-empty scaffolding so the tree stays readable.
+            ckpt_dir.rmdir()
+            trial_dir.rmdir()
+        except OSError:
+            pass
+    return reclaimed
+
+
 def export_trials_csv(study: optuna.Study, out_path: Path) -> None:
     ensure_dir(out_path.parent)
     df = study.trials_dataframe(
@@ -1695,12 +1984,22 @@ def print_window_summary(study: optuna.Study, window: int) -> None:
     )
     log.info("window=%s best params=%s", window, best.params)
     log.info(
-        "window=%s best attrs: F1_Up=%s Directional_Accuracy=%s effective_precision=%s",
+        "window=%s best precision=%s",
         window,
-        best.user_attrs.get("F1_Up"),
-        best.user_attrs.get("Directional_Accuracy"),
         best.user_attrs.get("effective_precision"),
     )
+    # F1_Up / Directional_Accuracy are only populated when --eval-test-metrics
+    # is set; printing them unconditionally reads as a failed computation
+    # rather than a disabled option.
+    f1_up = best.user_attrs.get("F1_Up")
+    da = best.user_attrs.get("Directional_Accuracy")
+    if f1_up is not None or da is not None:
+        log.info(
+            "window=%s best attrs: F1_Up=%s Directional_Accuracy=%s",
+            window,
+            f1_up,
+            da,
+        )
 
     completed = [
         t
@@ -1822,6 +2121,19 @@ def tune_window(cfg: TuneConfig, base_df: pd.DataFrame, window: int) -> Dict:
         )
         export_trials_csv(study, window_dir / "trials.csv")
         print_window_summary(study, window)
+        if not cfg.keep_trial_checkpoints:
+            reclaimed = prune_trial_checkpoints(
+                window_dir,
+                keep_trial=int(study.best_trial.number)
+                if study.best_trial is not None
+                else None,
+            )
+            if reclaimed:
+                log.info(
+                    "window=%s pruned stale trial checkpoints, reclaimed %.1f MB.",
+                    window,
+                    reclaimed / 1e6,
+                )
         if study.best_trial is not None:
             write_json(
                 window_dir / "best_trial.json",
@@ -1904,6 +2216,22 @@ def tune_window(cfg: TuneConfig, base_df: pd.DataFrame, window: int) -> Dict:
     export_trials_csv(study, window_dir / "trials.csv")
     print_window_summary(study, window)
 
+    if cfg.keep_trial_checkpoints:
+        log.info("window=%s retaining all trial checkpoints (--keep-trial-checkpoints).", window)
+    else:
+        best_number = (
+            int(study.best_trial.number) if study.best_trial is not None else None
+        )
+        reclaimed = prune_trial_checkpoints(window_dir, keep_trial=best_number)
+        if reclaimed:
+            log.info(
+                "window=%s pruned trial checkpoints, reclaimed %.1f MB "
+                "(kept trial %s).",
+                window,
+                reclaimed / 1e6,
+                best_number,
+            )
+
     best_payload: Dict = {}
     if study.best_trial is not None:
         best_payload = {
@@ -1934,20 +2262,16 @@ def tune_window(cfg: TuneConfig, base_df: pd.DataFrame, window: int) -> Dict:
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 5 — UNIFIED CONFIG
-# ══════════════════════════════════════════════════════════════════════════════
-
 @dataclass
 class UnifiedConfig:
     """Single config that encompasses all fields from RunConfig and TuneConfig.
 
-    Fields that have different defaults between training and tuning are given
-    distinct names (e.g. ``train_max_epochs`` vs ``tune_max_epochs``) so that
-    both defaults can be expressed independently in the CLI.
+    Fields with different defaults between training and tuning are given
+    distinct names (``train_max_epochs`` vs ``tune_max_epochs``) so both
+    defaults can be expressed independently in the CLI.
     """
 
-    # ── shared ───────────────────────────────────────────────────────────────
+    # shared
     data_path: Path
     windows: List[int]
     prediction_length: int
@@ -1955,7 +2279,7 @@ class UnifiedConfig:
     seed: int
     no_window_menu: bool
 
-    # ── training-specific ────────────────────────────────────────────────────
+    # training-specific
     train_artifact_root: Path
     train_max_epochs: int          # default 50
     train_patience: int            # default 8
@@ -1970,7 +2294,7 @@ class UnifiedConfig:
     train_limit_val_batches: int   # default 200
     train_accumulate_grad_batches: int  # default 2
 
-    # ── tuning-specific ──────────────────────────────────────────────────────
+    # tuning-specific
     tune_artifact_root: Path
     tune_max_epochs: int           # default 8
     tune_patience: int             # default 3
@@ -1981,6 +2305,7 @@ class UnifiedConfig:
     tune_accumulate_grad_batches: int   # default 1
     tune_limit_val_batches: int         # default 50
     eval_test_metrics: bool
+    keep_trial_checkpoints: bool
 
 
 def make_run_config(
@@ -1991,13 +2316,10 @@ def make_run_config(
     """
     Construct a RunConfig from UnifiedConfig.
 
-    ``windows`` overrides cfg.windows (used to pass a single-window list per
-    loop iteration while keeping the unified config intact).
-
-    ``hp_overrides`` is a dict of model HP values sourced from a completed
-    Optuna study (see ``load_tuned_hps_for_window``).  When provided, the
-    corresponding RunConfig fields are replaced; all other fields use the
-    UnifiedConfig values unchanged.
+    ``windows`` overrides cfg.windows, so a caller can pass a single-window list
+    per loop iteration while keeping the unified config intact. ``hp_overrides``
+    holds model HP values from a completed Optuna study; when provided, the
+    matching RunConfig fields are replaced and all others are left alone.
     """
     ovr: Dict = hp_overrides or {}
     return RunConfig(
@@ -2046,6 +2368,7 @@ def make_tune_config(cfg: UnifiedConfig) -> TuneConfig:
         accumulate_grad_batches=cfg.tune_accumulate_grad_batches,
         limit_val_batches=cfg.tune_limit_val_batches,
         eval_test_metrics=cfg.eval_test_metrics,
+        keep_trial_checkpoints=cfg.keep_trial_checkpoints,
     )
 
 
@@ -2090,9 +2413,9 @@ def load_tuned_hps_for_window(
                 params.get("attention_head_size_v2", 4),
             )
         ),
-        # lstm_layers was not part of the Optuna search space; replicate the
-        # tuner's fixed rule (1 for short windows, 2 for longer ones).
-        "lstm_layers": 1 if window <= 10 else 2,
+        # lstm_layers was not part of the Optuna search space; use the same
+        # shared rule the tuner applies so the two cannot drift apart.
+        "lstm_layers": lstm_layers_for_window(window),
         "dropout": float(params.get("dropout", 0.2)),
         "gradient_clip_val": float(params.get("gradient_clip_val", 0.5)),
     }
@@ -2102,9 +2425,30 @@ def load_tuned_hps_for_window(
     return hps
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 6 — CLI & MAIN
-# ══════════════════════════════════════════════════════════════════════════════
+def configure_runtime() -> None:
+    """Process-wide runtime tuning applied to every mode."""
+    try:
+        # Reduce file descriptor pressure from DataLoader shared-memory handles.
+        torch.multiprocessing.set_sharing_strategy("file_system")
+    except Exception:
+        pass
+    try:
+        # 6 physical cores: leave room for DataLoader workers and the GPU feeder.
+        torch.set_num_threads(4)
+        torch.set_num_interop_threads(1)
+    except Exception:
+        # set_num_interop_threads raises if called after parallel work starts.
+        pass
+    # TF32 matmuls on Ampere: large speedup, negligible accuracy cost here.
+    torch.set_float32_matmul_precision("medium")
+
+
+def release_gpu_memory() -> None:
+    """Drop cached allocations between windows so peak VRAM does not compound."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
 
 def show_main_menu() -> int:
     """Display the top-level interactive mode menu and return the chosen mode."""
@@ -2134,6 +2478,42 @@ def show_main_menu() -> int:
         print("Invalid choice. Please enter 0, 1, 2, or 3.")
 
 
+def write_metric_summary(
+    artifact_root: Path,
+    session_metrics: List[Dict],
+    summary_path: Path,
+) -> pd.DataFrame:
+    """Write a summary covering every window with metrics on disk.
+
+    Session results win on conflict; other windows are carried forward from
+    their own ``metrics.csv`` so re-running one window cannot shrink the summary.
+    """
+    by_window: Dict[int, Dict] = {}
+
+    for window_dir in sorted(artifact_root.glob("window_*")):
+        metrics_file = window_dir / "metrics.csv"
+        if not metrics_file.exists():
+            continue
+        try:
+            existing = pd.read_csv(metrics_file)
+        except Exception:
+            continue
+        if list(existing.columns) != FINAL_METRIC_COLUMNS or existing.empty:
+            continue
+        for row in existing.to_dict(orient="records"):
+            by_window[int(row["window"])] = row
+
+    for row in session_metrics:
+        by_window[int(row["window"])] = row
+
+    summary_df = pd.DataFrame(
+        [by_window[w] for w in sorted(by_window)], columns=FINAL_METRIC_COLUMNS
+    )
+    ensure_dir(summary_path.parent)
+    summary_df.to_csv(summary_path, index=False)
+    return summary_df
+
+
 def run_tuning_mode(cfg: UnifiedConfig, base_df: pd.DataFrame) -> None:
     """
     Run Optuna hyperparameter tuning for all selected windows, then optionally
@@ -2141,17 +2521,6 @@ def run_tuning_mode(cfg: UnifiedConfig, base_df: pd.DataFrame) -> None:
     """
     tune_cfg = make_tune_config(cfg)
     ensure_dir(tune_cfg.artifact_root)
-
-    # Reduce file descriptor pressure from DataLoader shared-memory handles.
-    try:
-        torch.multiprocessing.set_sharing_strategy("file_system")
-    except Exception:
-        pass
-    try:
-        torch.set_num_threads(4)
-        torch.set_num_interop_threads(1)
-    except Exception:
-        pass
 
     summary_rows: List[Dict] = []
     for window in tune_cfg.windows:
@@ -2181,14 +2550,16 @@ def run_tuning_mode(cfg: UnifiedConfig, base_df: pd.DataFrame) -> None:
     logging.info("Saved tuning summary -> %s", summary_path)
 
     # Mode 0 is defined as "tuning -> training/testing", so continue directly
-    # without an extra confirmation prompt.
+    # without an extra confirmation prompt, carrying the tuned window list
+    # through rather than falling back to DEFAULT_WINDOWS.
     logging.info(
-        "Tuning complete. Continuing directly to training/testing (mode 0)."
+        "Tuning complete. Continuing directly to training/testing for windows %s.",
+        tune_cfg.windows,
     )
     run_train_test_mode(
         cfg=cfg,
         base_df=base_df,
-        windows_override=list(DEFAULT_WINDOWS),
+        windows_override=list(tune_cfg.windows),
         skip_window_menu=True,
     )
 
@@ -2218,7 +2589,11 @@ def run_train_test_mode(
         windows = choose_windows_menu(default_windows=windows)
 
     all_metrics: List[Dict] = []
-    for window in tqdm(windows, desc="Training windows", unit="window"):
+    # Plain loop rather than tqdm: Lightning renders its own per-epoch bar per
+    # window, and one outer tick every few minutes conveys less than the
+    # per-window log lines below.
+    for position, window in enumerate(windows, start=1):
+        logging.info("=== window %s of %s (encoder=%s) ===", position, len(windows), window)
         hp_overrides = load_tuned_hps_for_window(
             window=window, tune_artifact_root=cfg.tune_artifact_root
         )
@@ -2230,9 +2605,13 @@ def run_train_test_mode(
             )
 
         run_cfg = make_run_config(cfg, windows=[window], hp_overrides=hp_overrides)
-        run_window_training(
-            cfg=run_cfg, base_df=base_df, window=window, metrics_rows=all_metrics
-        )
+        try:
+            run_window_training(
+                cfg=run_cfg, base_df=base_df, window=window, metrics_rows=all_metrics
+            )
+        finally:
+            # Otherwise four sequential windows compound cached VRAM.
+            release_gpu_memory()
 
     if not all_metrics:
         logging.warning(
@@ -2241,12 +2620,8 @@ def run_train_test_mode(
         )
         return
 
-    summary_df = pd.DataFrame(all_metrics)
-    summary_df = summary_df[FINAL_METRIC_COLUMNS].sort_values(
-        ["window"], kind="mergesort"
-    )
     summary_path = cfg.train_artifact_root / "metrics_summary.csv"
-    summary_df.to_csv(summary_path, index=False)
+    write_metric_summary(cfg.train_artifact_root, all_metrics, summary_path)
     logging.info("Saved global metrics summary -> %s", summary_path)
 
 
@@ -2263,7 +2638,8 @@ def run_inference_only_mode(cfg: UnifiedConfig, base_df: pd.DataFrame) -> None:
         windows = choose_windows_menu(default_windows=windows)
 
     all_metrics: List[Dict] = []
-    for window in tqdm(windows, desc="Inference windows", unit="window"):
+    for position, window in enumerate(windows, start=1):
+        logging.info("=== window %s of %s (encoder=%s) ===", position, len(windows), window)
         window_dir = cfg.train_artifact_root / f"window_{window}"
         checkpoints_dir = window_dir / "checkpoints"
         state_path = window_dir / "state.json"
@@ -2271,17 +2647,21 @@ def run_inference_only_mode(cfg: UnifiedConfig, base_df: pd.DataFrame) -> None:
 
         # Locate best checkpoint (prefer state.json metadata, then filesystem scan).
         state = read_json(state_path) if state_path.exists() else {}
-        best_ckpt = state.get("best_ckpt", "")
-        if not best_ckpt or not Path(best_ckpt).exists():
-            latest = find_latest_checkpoint(checkpoints_dir)
-            if latest is None:
+        resolved = resolve_checkpoint(state.get("best_ckpt", ""), checkpoints_dir)
+        if resolved is None:
+            # Must be find_best_checkpoint, not find_latest_checkpoint: the
+            # newest file by mtime is last.ckpt / step-*.ckpt, which would
+            # score the final epoch instead of the best one.
+            best = find_best_checkpoint(checkpoints_dir)
+            if best is None:
                 logging.warning(
                     "window=%s no checkpoint found under %s — skipping.",
                     window,
                     checkpoints_dir,
                 )
                 continue
-            best_ckpt = str(latest)
+            resolved = best
+        best_ckpt = str(resolved)
 
         logging.info(
             "window=%s inference using checkpoint: %s", window, best_ckpt
@@ -2294,37 +2674,37 @@ def run_inference_only_mode(cfg: UnifiedConfig, base_df: pd.DataFrame) -> None:
         )
 
         batch_size = WINDOW_BATCH_SIZE.get(window, 64)
+        _, eval_workers = pick_loader_workers(cfg.num_workers)
         test_loader = test_ds.to_dataloader(
             train=False,
             batch_size=batch_size,
-            num_workers=cfg.num_workers,
-            persistent_workers=cfg.num_workers > 0,
+            num_workers=eval_workers,
+            persistent_workers=False,
             pin_memory=torch.cuda.is_available(),
         )
 
         ensure_dir(window_dir)
-        evaluate_window_and_write_outputs(
-            window=window,
-            prediction_length=cfg.prediction_length,
-            work_df=work_df,
-            test_loader=test_loader,
-            best_ckpt=best_ckpt,
-            window_dir=window_dir,
-            metrics_path=metrics_path,
-            metrics_rows=all_metrics,
-            state_path=state_path,
-        )
+        try:
+            evaluate_window_and_write_outputs(
+                window=window,
+                prediction_length=cfg.prediction_length,
+                work_df=work_df,
+                test_loader=test_loader,
+                best_ckpt=best_ckpt,
+                window_dir=window_dir,
+                metrics_path=metrics_path,
+                metrics_rows=all_metrics,
+                state_path=state_path,
+            )
+        finally:
+            release_gpu_memory()
 
     if not all_metrics:
         logging.warning("No inference outputs produced.")
         return
 
-    summary_df = pd.DataFrame(all_metrics)
-    summary_df = summary_df[FINAL_METRIC_COLUMNS].sort_values(
-        ["window"], kind="mergesort"
-    )
     summary_path = cfg.train_artifact_root / "inference_summary.csv"
-    summary_df.to_csv(summary_path, index=False)
+    write_metric_summary(cfg.train_artifact_root, all_metrics, summary_path)
     logging.info("Saved inference summary -> %s", summary_path)
 
 
@@ -2337,7 +2717,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # ── mode (optional bypass of interactive menu) ───────────────────────────
+    # mode (optional bypass of interactive menu)
     parser.add_argument(
         "--mode",
         type=int,
@@ -2349,7 +2729,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    # ── shared args ──────────────────────────────────────────────────────────
+    # shared args
     parser.add_argument("--data-path", default=str(DEFAULT_DATA_PATH))
     parser.add_argument("--windows", default="7,10,15,30")
     parser.add_argument(
@@ -2363,7 +2743,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
 
-    # ── training args ────────────────────────────────────────────────────────
+    # training args
     train_grp = parser.add_argument_group("training")
     train_grp.add_argument(
         "--train-artifact-root", default=str(DEFAULT_TRAIN_ARTIFACT_ROOT)
@@ -2381,7 +2761,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train_grp.add_argument("--train-limit-val-batches", type=int, default=200)
     train_grp.add_argument("--train-accumulate-grad-batches", type=int, default=2)
 
-    # ── tuning args ──────────────────────────────────────────────────────────
+    # tuning args
     tune_grp = parser.add_argument_group("tuning")
     tune_grp.add_argument(
         "--tune-artifact-root", default=str(DEFAULT_TUNE_ARTIFACT_ROOT)
@@ -2411,6 +2791,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     tune_grp.add_argument("--tune-accumulate-grad-batches", type=int, default=1)
     tune_grp.add_argument("--tune-limit-val-batches", type=int, default=50)
     tune_grp.add_argument("--eval-test-metrics", action="store_true")
+    tune_grp.add_argument(
+        "--keep-trial-checkpoints",
+        action="store_true",
+        help=(
+            "Retain per-trial checkpoints after a study finishes. Off by default: "
+            "nothing reads them back and they dominate tuning artifact size."
+        ),
+    )
 
     return parser
 
@@ -2457,23 +2845,28 @@ def make_unified_config(args: argparse.Namespace) -> UnifiedConfig:
         tune_accumulate_grad_batches=int(args.tune_accumulate_grad_batches),
         tune_limit_val_batches=int(args.tune_limit_val_batches),
         eval_test_metrics=bool(args.eval_test_metrics),
+        keep_trial_checkpoints=bool(args.keep_trial_checkpoints),
     )
 
 
 def main() -> None:
     configure_logging()
     configure_warnings()
-
-    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-    os.environ.setdefault("OMP_NUM_THREADS", "4")
-    os.environ.setdefault("MALLOC_TRIM_THRESHOLD_", "100000")
+    # NOTE: thread-limit env vars are set at module import, before torch loads.
 
     parser = build_arg_parser()
     args = parser.parse_args()
     cfg = make_unified_config(args)
 
-    torch.set_float32_matmul_precision("medium")
+    configure_runtime()
     set_seed(cfg.seed)
+
+    device = describe_device()
+    logging.info(
+        "Device: %s | precision policy: %s",
+        device,
+        pick_precision_sequence(),
+    )
 
     logging.info("Loading dataset from %s", cfg.data_path)
     base_df = load_and_prepare_dataframe(cfg.data_path)

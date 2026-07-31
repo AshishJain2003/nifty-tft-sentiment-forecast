@@ -1,15 +1,28 @@
+# Secrets / private material
 .env
 Ref_Materials/
 
+# Python
 __pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
 
+# Large intermediate datasets (regenerate with the pipeline)
 dataset/news_segregation_checkpoints
 dataset/raw_dataset
 dataset/stock_dataset
 dataset/news_sentiment.csv
 dataset/processed_news_dataset.csv
 dataset/tier_segregated_news.csv
+# Scratch buckets from the external chronological sort in stage 1
+dataset/.*_sort_buckets/
 
+# Local backups of previous runs (checkpoints, studies, predictions)
+artifacts-backup*/
+
+# Model artifacts (metrics + tuning summaries stay tracked)
 artifacts/**/checkpoints/
 artifacts/**/logs/
 artifacts/**/trials/
@@ -17,5 +30,9 @@ artifacts/**/*.ckpt
 artifacts/**/*.db
 artifacts/**/test_predictions.csv
 artifacts/**/state.json
+artifacts/**/run_manifest.json
 
+# Editor / tooling
 .codex
+.claude/
+.DS_Store

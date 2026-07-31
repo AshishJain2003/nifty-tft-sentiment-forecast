@@ -1,53 +1,21 @@
 #!/usr/bin/env python3
 """
-News Dataset Preprocessing Pipeline - Memory-Efficient Chunked Processing
+Merge the raw scraper CSVs into one dataset and clean it in chunks.
 
-PREPROCESSING OPERATIONS:
-═══════════════════════════════════════════════════════════════════════════════
-Phase 1: Chunked Merging
-  • Merge all *_raw.csv files from dataset/raw_dataset/ into single CSV
-  • Process in 100k-row chunks to prevent memory overflow
-
-Phase 2: In-Place Cleaning & Transformation
-  Structural Integration:
-    • Standardize columns to ['date', 'title', 'news', 'url']
-    • Drop null values in critical columns (date, title, news)
-    • Global deduplication using URL hash set across all chunks
-  
-  Text & NLP Preprocessing:
-    • HTML entity decoding (&amp; → &, &#8211; → –, etc.)
-    • Typography normalization (smart quotes → ASCII, em-dash → hyphen)
-    • Remove "ALSO READ..." promotional artifacts
-    • Strip embedded URLs (http/https) and email addresses
-    • Remove boilerplate ("Download the app", "Subscribe", "Disclaimer")
-    • Newline/carriage return → period + space
-    • Collapse multiple spaces into single space
-    • Length filtering (title ≥3 chars, news ≥100 chars)
-  
-  Temporal Preprocessing:
-    • Parse dates to YYYY-MM-DD format
-    • Coerce invalid dates to NaT and drop
-    • Enforce date window: 2020-01-01 to 2026-03-31
-  
-  Post-Processing:
-    • Chronological sorting by date (memory-efficient external sort)
-═══════════════════════════════════════════════════════════════════════════════
+Phase 1 concatenates dataset/raw_dataset/*_raw.csv onto a common column layout.
+Phase 2 drops nulls and duplicate URLs, strips HTML entities, boilerplate, URLs
+and email addresses out of the text, filters by date and length, and sorts the
+result chronologically.
 """
 
 import pandas as pd
-import numpy as np
 from pathlib import Path
 import html
 import re
-from datetime import datetime
-import tempfile
 import shutil
 from typing import Set
 import time
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION
-# ═══════════════════════════════════════════════════════════════════════════════
 
 CHUNK_SIZE = 100_000
 START_DATE = "2020-01-01"
@@ -114,16 +82,10 @@ URL_PATTERN = r"https?://[^\s<>\"]+|www\.[^\s<>\"]+"
 EMAIL_PATTERN = r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TEXT PREPROCESSING FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def decode_html_entities(text: pd.Series) -> pd.Series:
     """Decode HTML entities in text using vectorized operations."""
-    # Standard HTML decoding
     text = text.apply(lambda x: html.unescape(x) if pd.notna(x) else x)
     
-    # Additional numeric/named entities
     for entity, replacement in HTML_ENTITIES_EXTRA.items():
         text = text.str.replace(entity, replacement, regex=False)
     
@@ -158,15 +120,10 @@ def remove_boilerplate(text: pd.Series) -> pd.Series:
 
 def normalize_whitespace(text: pd.Series) -> pd.Series:
     """Normalize newlines and collapse multiple spaces."""
-    # Replace newlines and carriage returns with period + space
     text = text.str.replace(r"[\n\r]+", ". ", regex=True)
-    # Collapse multiple spaces into single space
     text = text.str.replace(r"\s+", " ", regex=True)
-    # Strip leading/trailing whitespace
     text = text.str.strip()
-    # Fix multiple periods
     text = text.str.replace(r"\.{2,}", ".", regex=True)
-    # Fix period-space-period patterns
     text = text.str.replace(r"\.\s+\.", ".", regex=True)
     return text
 
@@ -186,16 +143,10 @@ def preprocess_text_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# DATE PREPROCESSING FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def parse_and_filter_dates(df: pd.DataFrame, start_date: str, end_date: str) -> pd.DataFrame:
     """Parse dates to YYYY-MM-DD format and filter by date range."""
-    # Parse dates (coerce errors to NaT)
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     
-    # Drop rows with invalid dates
     before_count = len(df)
     df = df.dropna(subset=["date"])
     invalid_count = before_count - len(df)
@@ -203,7 +154,6 @@ def parse_and_filter_dates(df: pd.DataFrame, start_date: str, end_date: str) -> 
     if invalid_count > 0:
         print(f"    ⚠ Dropped {invalid_count:,} rows with invalid dates")
     
-    # Filter by date range
     start = pd.to_datetime(start_date)
     end = pd.to_datetime(end_date)
     
@@ -214,22 +164,15 @@ def parse_and_filter_dates(df: pd.DataFrame, start_date: str, end_date: str) -> 
     if filtered_count > 0:
         print(f"    ⚠ Filtered {filtered_count:,} rows outside date range [{start_date}, {end_date}]")
     
-    # Format as YYYY-MM-DD
     df["date"] = df["date"].dt.strftime("%Y-%m-%d")
     
     return df
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# STRUCTURAL PREPROCESSING FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Standardize column names to lowercase and keep only required columns."""
-    # Lowercase all column names
     df.columns = df.columns.str.lower().str.strip()
     
-    # Keep only standard columns that exist
     existing_cols = [col for col in STANDARD_COLUMNS if col in df.columns]
     df = df[existing_cols]
     
@@ -268,10 +211,8 @@ def deduplicate_chunk(df: pd.DataFrame, seen_urls: Set[str]) -> tuple[pd.DataFra
     """Remove duplicate URLs using global hash set."""
     before_count = len(df)
     
-    # Filter out already-seen URLs
     df = df[~df["url"].isin(seen_urls)]
     
-    # Add new URLs to seen set
     new_urls = set(df["url"].values)
     seen_urls.update(new_urls)
     
@@ -282,17 +223,12 @@ def deduplicate_chunk(df: pd.DataFrame, seen_urls: Set[str]) -> tuple[pd.DataFra
     return df, seen_urls
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# PHASE 1: CHUNKED MERGING
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def merge_raw_files():
     """Merge all *_raw.csv files from raw_dataset directory into single CSV."""
     print("=" * 80)
     print("PHASE 1: CHUNKED MERGING")
     print("=" * 80)
     
-    # Get all *_raw.csv files
     raw_files = sorted(RAW_DATA_DIR.glob("*_raw.csv"))
     
     if not raw_files:
@@ -307,7 +243,6 @@ def merge_raw_files():
     print(f"\nMerging into: {OUTPUT_FILE}")
     print(f"Chunk size: {CHUNK_SIZE:,} rows\n")
     
-    # Remove existing output file if it exists
     if OUTPUT_FILE.exists():
         OUTPUT_FILE.unlink()
         print("  ✓ Removed existing output file\n")
@@ -323,13 +258,15 @@ def merge_raw_files():
         chunk_num = 0
         
         try:
-            # Read file in chunks
             for chunk in pd.read_csv(raw_file, chunksize=CHUNK_SIZE, low_memory=False):
                 chunk_num += 1
                 chunk_rows = len(chunk)
                 file_rows += chunk_rows
-                
-                # Write to output (header only on first chunk)
+
+                # Force every chunk onto the standard layout before appending.
+                chunk.columns = chunk.columns.str.lower().str.strip()
+                chunk = chunk.reindex(columns=STANDARD_COLUMNS)
+
                 mode = "w" if not header_written else "a"
                 chunk.to_csv(OUTPUT_FILE, mode=mode, index=False, header=not header_written)
                 
@@ -351,9 +288,68 @@ def merge_raw_files():
     print()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# PHASE 2: IN-PLACE PREPROCESSING
-# ═══════════════════════════════════════════════════════════════════════════════
+def sort_csv_by_date(csv_path: Path) -> None:
+    """Sort a CSV chronologically without holding it all in memory.
+
+    Two-pass bucket sort on the `YYYY-MM` prefix: pass one scatters rows into
+    one temp file per month, pass two sorts each bucket in memory and appends it
+    in calendar order. Peak memory is one bucket rather than one dataset, which
+    matters because the cleaned news file is ~800 MB on disk.
+    """
+    bucket_dir = csv_path.parent / f".{csv_path.stem}_sort_buckets"
+    if bucket_dir.exists():
+        shutil.rmtree(bucket_dir)
+    bucket_dir.mkdir(parents=True)
+
+    sorted_path = csv_path.parent / f"sorted_{csv_path.name}"
+    total_rows = 0
+
+    try:
+        print("  → Pass 1/2: partitioning rows by month...")
+        bucket_has_header: Set[str] = set()
+
+        for chunk in pd.read_csv(csv_path, chunksize=CHUNK_SIZE, low_memory=False):
+            # Dates were already normalized to YYYY-MM-DD in parse_and_filter_dates,
+            # so the first 7 characters are a sortable month key.
+            keys = chunk["date"].astype(str).str.slice(0, 7)
+            for month, part in chunk.groupby(keys, sort=False):
+                bucket_path = bucket_dir / f"{month}.csv"
+                write_header = month not in bucket_has_header
+                part.to_csv(
+                    bucket_path,
+                    mode="w" if write_header else "a",
+                    index=False,
+                    header=write_header,
+                )
+                bucket_has_header.add(month)
+            total_rows += len(chunk)
+
+        print(f"  ✓ Partitioned {total_rows:,} rows into {len(bucket_has_header)} monthly buckets")
+
+        print("  → Pass 2/2: sorting buckets and concatenating...")
+        header_written = False
+        for bucket_path in sorted(bucket_dir.glob("*.csv")):
+            bucket = pd.read_csv(bucket_path, low_memory=False)
+            bucket = bucket.sort_values("date", ascending=True, kind="mergesort")
+            bucket.to_csv(
+                sorted_path,
+                mode="w" if not header_written else "a",
+                index=False,
+                header=not header_written,
+            )
+            header_written = True
+
+        if not header_written:
+            raise RuntimeError("External sort produced no output rows.")
+
+        shutil.move(str(sorted_path), str(csv_path))
+        print("  ✓ Sorting complete\n")
+
+    finally:
+        shutil.rmtree(bucket_dir, ignore_errors=True)
+        if sorted_path.exists():
+            sorted_path.unlink()
+
 
 def preprocess_merged_file():
     """Apply all preprocessing transformations to merged file using chunks."""
@@ -369,7 +365,6 @@ def preprocess_merged_file():
     print(f"Input file: {OUTPUT_FILE.name} ({file_size:.1f} MB)")
     print(f"Chunk size: {CHUNK_SIZE:,} rows\n")
     
-    # Create temporary output file
     temp_file = OUTPUT_FILE.parent / f"temp_{OUTPUT_FILE.name}"
     
     seen_urls: Set[str] = set()
@@ -391,38 +386,31 @@ def preprocess_merged_file():
             
             print(f"Chunk {chunk_num}: {input_rows:,} rows")
             
-            # 1. Standardize columns
             chunk = standardize_columns(chunk)
             
-            # 2. Drop nulls
             chunk = drop_nulls(chunk)
             
-            # 3. Deduplicate
             chunk, seen_urls = deduplicate_chunk(chunk, seen_urls)
             
             if len(chunk) == 0:
                 print(f"  ⚠ Chunk empty after deduplication, skipping\n")
                 continue
             
-            # 4. Parse and filter dates
             chunk = parse_and_filter_dates(chunk, START_DATE, END_DATE)
             
             if len(chunk) == 0:
                 print(f"  ⚠ Chunk empty after date filtering, skipping\n")
                 continue
             
-            # 5. Text preprocessing
             print(f"    → Applying text preprocessing...")
             chunk = preprocess_text_columns(chunk)
             
-            # 6. Length filtering
             chunk = filter_by_length(chunk)
             
             if len(chunk) == 0:
                 print(f"  ⚠ Chunk empty after length filtering, skipping\n")
                 continue
             
-            # Write to temp file
             mode = "w" if not header_written else "a"
             chunk.to_csv(temp_file, mode=mode, index=False, header=not header_written)
             
@@ -445,31 +433,12 @@ def preprocess_merged_file():
     print("=" * 80)
     print("SORTING BY DATE (Chronological Order)...")
     print("=" * 80)
-    
-    # Sort the temp file (memory-efficient: read in chunks, sort, write)
+
     try:
-        print("Reading cleaned data for sorting...")
-        
-        # For very large files, we'd need external sorting, but for moderate sizes:
-        # Try to read all at once for sorting. If it fails, skip sorting.
-        try:
-            df_sorted = pd.read_csv(temp_file)
-            print(f"  ✓ Loaded {len(df_sorted):,} rows into memory")
-            
-            print("  → Sorting by date...")
-            df_sorted = df_sorted.sort_values("date", ascending=True)
-            
-            print("  → Writing sorted data...")
-            df_sorted.to_csv(temp_file, index=False)
-            print("  ✓ Sorting complete\n")
-            
-        except MemoryError:
-            print("  ⚠ File too large to sort in memory, skipping sort step\n")
-    
+        sort_csv_by_date(temp_file)
     except Exception as e:
         print(f"  ⚠ Could not sort file: {e}\n")
-    
-    # Replace original file with cleaned file
+
     print("Finalizing...")
     shutil.move(str(temp_file), str(OUTPUT_FILE))
     
@@ -487,10 +456,6 @@ def preprocess_merged_file():
     print("=" * 80)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN EXECUTION
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def main():
     """Execute full preprocessing pipeline."""
     print("\n")
@@ -501,10 +466,8 @@ def main():
     
     overall_start = time.time()
     
-    # Phase 1: Merge all raw files
     merge_raw_files()
     
-    # Phase 2: Clean and preprocess
     preprocess_merged_file()
     
     overall_time = time.time() - overall_start

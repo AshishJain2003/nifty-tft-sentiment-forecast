@@ -1,44 +1,31 @@
 #!/usr/bin/env python3
 """
-Nifty Stock Price Scraper from Yahoo Finance
-=============================================
-Downloads historical stock prices for Nifty 50/100/200 constituents.
+Download historical OHLCV for Nifty 50/100/200 constituents from Yahoo Finance.
 
-Features:
-* Fetches current constituent lists from NSE India
-* Handles ticker symbol changes/renamings
-* Parallel processing using all 12 CPU threads
-* Checkpoint/resume capability
-* Rate limiting to avoid Yahoo Finance blocks
-* Comprehensive error handling
+Constituent lists come from the NSE index archives (CSV), cached locally so a
+stale-list fallback is always available. Ticker renames are resolved lazily
+during download, symbols are fetched in parallel with rate limiting, and
+progress is checkpointed so a run can resume without losing earlier rows.
 
-Usage:
-    conda activate ml
-    cd src/scrapers
-    python nifty_yfinance_scraper.py --index nifty50
-    python nifty_yfinance_scraper.py --index nifty100
-    python nifty_yfinance_scraper.py --index nifty200
-    python nifty_yfinance_scraper.py --index all
+    conda activate MarketFusion
+    python src/scrapers/nifty_yfinance_scraper.py --index nifty50
+    python src/scrapers/nifty_yfinance_scraper.py --index all
 """
 
 import argparse
+import io
 import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
 import requests
 import yfinance as yf
-from bs4 import BeautifulSoup
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION
-# ═══════════════════════════════════════════════════════════════════════════════
 
 # Date range for historical data
 START_DATE = "2020-01-01"
@@ -59,10 +46,25 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
 OUTPUT_DIR = PROJECT_ROOT / "dataset" / "stock_dataset"
 CHECKPOINT_DIR = OUTPUT_DIR / "checkpoint"
+CONSTITUENTS_DIR = OUTPUT_DIR / "constituents"
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# LOGGING
-# ═══════════════════════════════════════════════════════════════════════════════
+# NSE publishes index constituents as CSVs on its archive host. The older
+# www.nseindia.com/api/equity-stockIndices endpoint now returns 404.
+NSE_INDEX_FILES = {
+    "nifty50": "ind_nifty50list.csv",
+    "nifty100": "ind_nifty100list.csv",
+    "nifty200": "ind_nifty200list.csv",
+}
+NSE_ARCHIVE_BASE = "https://nsearchives.nseindia.com/content/indices"
+NSE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/csv,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,35 +73,15 @@ logging.basicConfig(
 )
 log = logging.getLogger("nifty_scraper")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TICKER SYMBOL MAPPINGS (handle renamings/mergers)
-# ═══════════════════════════════════════════════════════════════════════════════
 
-# Known ticker symbol changes (old_symbol -> new_symbol)
+# NSE symbols that Yahoo Finance lists under a different ticker.
+# Keys are bare NSE symbols, values are Yahoo symbols (suffix included).
 TICKER_CHANGES = {
-    "YESBANK": "YESBANK.NS",
-    "VEDL": "VEDL.NS",
-    "JSWSTEEL": "JSWSTEEL.NS",
-    # Add more as needed
+    # Tata Motors demerged: the original entity (and its full price history)
+    # is now Tata Motors Passenger Vehicles; the CV business trades as TMCV.
+    "TATAMOTORS": "TMPV.NS",
 }
 
-# Special case mappings for companies with name changes
-COMPANY_NAME_FIXES = {
-    "Adani Ports and Special Economic Zone": "ADANIPORTS",
-    "Adani Ports & SEZ": "ADANIPORTS",
-    "Bajaj Finance": "BAJFINANCE",
-    "Bajaj Finserv": "BAJAJFINSV",
-    "Bharti Airtel": "BHARTIARTL",
-    "HDFC Bank": "HDFCBANK",
-    "ICICI Bank": "ICICIBANK",
-    "State Bank of India": "SBIN",
-    "Tata Consultancy Services": "TCS",
-    "Tata Steel": "TATASTEEL",
-}
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# DATA STRUCTURES
-# ═══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class Stock:
@@ -123,230 +105,122 @@ class DownloadStats:
             f"success={self.success} failed={self.failed} skipped={self.skipped}"
         )
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# NIFTY CONSTITUENT FETCHERS
-# ═══════════════════════════════════════════════════════════════════════════════
 
-def fetch_nifty50_constituents() -> list[Stock]:
-    """Fetch current Nifty 50 constituent list from NSE India."""
-    log.info("Fetching Nifty 50 constituents from NSE...")
-    
-    url = "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%2050"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
-        "Accept": "application/json",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    
-    try:
-        # NSE requires a session with cookies
-        session = requests.Session()
-        session.get("https://www.nseindia.com", headers=headers, timeout=10)
-        time.sleep(1)
-        
-        response = session.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        stocks = []
-        for item in data.get("data", []):
-            symbol = item.get("symbol", "").strip()
-            company = item.get("meta", {}).get("companyName", "") or item.get("symbol", "")
-            
-            if symbol and symbol not in ["NIFTY 50", "Nifty 50"]:
-                # Add .NS suffix for Yahoo Finance
-                yf_symbol = f"{symbol}.NS"
-                stocks.append(Stock(yf_symbol, company, "nifty50"))
-        
-        log.info(f"✓ Fetched {len(stocks)} Nifty 50 stocks")
-        return stocks
-    
-    except Exception as e:
-        log.error(f"Failed to fetch Nifty 50 from NSE API: {e}")
-        log.info("Falling back to hardcoded Nifty 50 list...")
-        return get_fallback_nifty50()
+def _parse_constituents_csv(text: str, index_name: str) -> list[Stock]:
+    """Turn an NSE index CSV into Stock records with Yahoo Finance symbols."""
+    df = pd.read_csv(io.StringIO(text))
 
-def fetch_nifty100_constituents() -> list[Stock]:
-    """Fetch current Nifty 100 constituent list."""
-    log.info("Fetching Nifty 100 constituents from NSE...")
-    
-    url = "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%20100"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
-        "Accept": "application/json",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    
-    try:
-        session = requests.Session()
-        session.get("https://www.nseindia.com", headers=headers, timeout=10)
-        time.sleep(1)
-        
-        response = session.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        stocks = []
-        for item in data.get("data", []):
-            symbol = item.get("symbol", "").strip()
-            company = item.get("meta", {}).get("companyName", "") or item.get("symbol", "")
-            
-            if symbol and symbol not in ["NIFTY 100", "Nifty 100"]:
-                yf_symbol = f"{symbol}.NS"
-                stocks.append(Stock(yf_symbol, company, "nifty100"))
-        
-        log.info(f"✓ Fetched {len(stocks)} Nifty 100 stocks")
-        return stocks
-    
-    except Exception as e:
-        log.error(f"Failed to fetch Nifty 100: {e}")
-        return []
+    if "Symbol" not in df.columns:
+        raise ValueError(f"unexpected columns in NSE CSV: {list(df.columns)}")
 
-def fetch_nifty200_constituents() -> list[Stock]:
-    """Fetch current Nifty 200 constituent list."""
-    log.info("Fetching Nifty 200 constituents from NSE...")
-    
-    url = "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%20200"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
-        "Accept": "application/json",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    
-    try:
-        session = requests.Session()
-        session.get("https://www.nseindia.com", headers=headers, timeout=10)
-        time.sleep(1)
-        
-        response = session.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        stocks = []
-        for item in data.get("data", []):
-            symbol = item.get("symbol", "").strip()
-            company = item.get("meta", {}).get("companyName", "") or item.get("symbol", "")
-            
-            if symbol and symbol not in ["NIFTY 200", "Nifty 200"]:
-                yf_symbol = f"{symbol}.NS"
-                stocks.append(Stock(yf_symbol, company, "nifty200"))
-        
-        log.info(f"✓ Fetched {len(stocks)} Nifty 200 stocks")
-        return stocks
-    
-    except Exception as e:
-        log.error(f"Failed to fetch Nifty 200: {e}")
-        return []
-
-def get_fallback_nifty50() -> list[Stock]:
-    """Hardcoded Nifty 50 list as fallback (current as of Apr 2024)."""
-    symbols = [
-        "ADANIPORTS", "ASIANPAINT", "AXISBANK", "BAJAJ-AUTO", "BAJFINANCE",
-        "BAJAJFINSV", "BHARTIARTL", "BPCL", "BRITANNIA", "CIPLA",
-        "COALINDIA", "DIVISLAB", "DRREDDY", "EICHERMOT", "GRASIM",
-        "HCLTECH", "HDFCBANK", "HDFCLIFE", "HEROMOTOCO", "HINDALCO",
-        "HINDUNILVR", "ICICIBANK", "INDUSINDBK", "INFY", "ITC",
-        "JSWSTEEL", "KOTAKBANK", "LT", "M&M", "MARUTI",
-        "NESTLEIND", "NTPC", "ONGC", "POWERGRID", "RELIANCE",
-        "SBILIFE", "SBIN", "SUNPHARMA", "TATACONSUM", "TATAMOTORS",
-        "TATASTEEL", "TCS", "TECHM", "TITAN", "ULTRACEMCO",
-        "WIPRO", "APOLLOHOSP", "ADANIENT", "LTIM", "TRENT"
-    ]
-    return [Stock(f"{s}.NS", s, "nifty50") for s in symbols]
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# TICKER SYMBOL VALIDATION & CORRECTION
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def validate_and_fix_ticker(stock: Stock) -> Optional[Stock]:
-    """Validate ticker exists on Yahoo Finance, handle renamings."""
-    
-    # Try original symbol first
-    try:
-        ticker = yf.Ticker(stock.symbol)
-        info = ticker.info
-        
-        # Check if data exists
-        if info and "symbol" in info:
-            return stock
-    except Exception:
-        pass
-    
-    # Check if there's a known mapping
-    base_symbol = stock.symbol.replace(".NS", "")
-    if base_symbol in TICKER_CHANGES:
-        new_symbol = TICKER_CHANGES[base_symbol]
-        if not new_symbol.endswith(".NS"):
-            new_symbol += ".NS"
-        
-        log.info(f"  ↻ Ticker renamed: {stock.symbol} → {new_symbol}")
-        return Stock(new_symbol, stock.company, stock.index)
-    
-    # Try alternative suffixes
-    alternatives = [
-        stock.symbol,
-        base_symbol + ".NS",
-        base_symbol + ".BO",  # Bombay Stock Exchange
-    ]
-    
-    for alt_symbol in alternatives:
-        try:
-            ticker = yf.Ticker(alt_symbol)
-            info = ticker.info
-            if info and "symbol" in info:
-                if alt_symbol != stock.symbol:
-                    log.info(f"  ↻ Using alternative: {stock.symbol} → {alt_symbol}")
-                return Stock(alt_symbol, stock.company, stock.index)
-        except Exception:
+    stocks = []
+    for _, row in df.iterrows():
+        symbol = str(row["Symbol"]).strip()
+        if not symbol or symbol.lower() == "nan":
             continue
-    
-    log.warning(f"  ✗ Could not validate ticker: {stock.symbol} ({stock.company})")
-    return None
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# DOWNLOAD FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════════════════
+        company = str(row.get("Company Name", symbol)).strip() or symbol
+        # Yahoo Finance lists NSE equities with a .NS suffix.
+        yf_symbol = TICKER_CHANGES.get(symbol, f"{symbol}.NS")
+        stocks.append(Stock(yf_symbol, company, index_name))
 
-def download_stock_data(stock: Stock, start: str, end: str) -> Optional[pd.DataFrame]:
-    """Download historical data for a single stock with retry logic."""
-    
+    return stocks
+
+
+def fetch_constituents(index_name: str) -> list[Stock]:
+    """Fetch an index's constituents from NSE, falling back to the local cache."""
+    csv_name = NSE_INDEX_FILES[index_name]
+    cache_file = CONSTITUENTS_DIR / csv_name
+
+    log.info(f"Fetching {index_name} constituents from NSE archives...")
+    try:
+        response = requests.get(
+            f"{NSE_ARCHIVE_BASE}/{csv_name}", headers=NSE_HEADERS, timeout=20
+        )
+        response.raise_for_status()
+        stocks = _parse_constituents_csv(response.text, index_name)
+
+        if not stocks:
+            raise ValueError("NSE returned an empty constituent list")
+
+        # Cache the raw CSV so a later network failure still has a usable list.
+        CONSTITUENTS_DIR.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(response.text)
+
+        log.info(f"  ✓ Fetched {len(stocks)} {index_name} stocks")
+        return stocks
+
+    except Exception as e:
+        log.error(f"Failed to fetch {index_name} from NSE: {e}")
+
+        if cache_file.exists():
+            log.warning(f"  ↻ Falling back to cached list: {cache_file}")
+            try:
+                stocks = _parse_constituents_csv(cache_file.read_text(), index_name)
+                log.info(f"  ✓ Loaded {len(stocks)} {index_name} stocks from cache")
+                return stocks
+            except Exception as cache_error:
+                log.error(f"Cached list is unusable: {cache_error}")
+
+        log.error(f"No constituent list available for {index_name} - skipping")
+        return []
+
+
+def _fetch_history(symbol: str, start: str, end: str) -> Optional[pd.DataFrame]:
+    """Fetch one symbol's OHLCV, retrying transient failures. None if no data."""
     for attempt in range(MAX_RETRIES):
         try:
-            ticker = yf.Ticker(stock.symbol)
-            df = ticker.history(start=start, end=end, auto_adjust=False)
-            
-            if df.empty:
-                log.warning(f"  ⚠ No data for {stock.symbol} ({stock.company})")
-                return None
-            
-            # Add metadata columns
-            df["Symbol"] = stock.symbol
-            df["Company"] = stock.company
-            df["Index"] = stock.index
-            
-            # Reset index to make Date a column
-            df.reset_index(inplace=True)
-            
-            # Reorder columns (include Adj Close)
-            cols = ["Date", "Symbol", "Company", "Index", "Open", "High", "Low", "Close", "Adj Close", "Volume", "Dividends", "Stock Splits"]
-            df = df[cols]
-            
+            df = yf.Ticker(symbol).history(start=start, end=end, auto_adjust=False)
             time.sleep(RATE_LIMIT_DELAY)
-            return df
-        
+            return None if df.empty else df
+
         except Exception as e:
             if attempt < MAX_RETRIES - 1:
-                log.warning(f"  ⚠ Attempt {attempt + 1} failed for {stock.symbol}: {e}")
+                log.warning(f"  ⚠ Attempt {attempt + 1} failed for {symbol}: {e}")
                 time.sleep(RETRY_DELAY)
             else:
-                log.error(f"  ✗ Failed to download {stock.symbol} after {MAX_RETRIES} attempts: {e}")
-                return None
-    
+                log.error(f"  ✗ Failed to download {symbol} after {MAX_RETRIES} attempts: {e}")
+
     return None
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CHECKPOINT SYSTEM
-# ═══════════════════════════════════════════════════════════════════════════════
+
+def download_stock_data(stock: Stock, start: str, end: str) -> Optional[pd.DataFrame]:
+    """Download historical data for a stock, trying the BSE listing as a fallback.
+
+    Resolution happens here rather than in a separate validation pass: probing
+    with Ticker.info costs an extra request per symbol and gets rate-limited,
+    and history() already tells us whether the symbol resolves.
+    """
+    base_symbol = stock.symbol.rsplit(".", 1)[0]
+    candidates = [stock.symbol, f"{base_symbol}.BO"]
+
+    for candidate in dict.fromkeys(candidates):
+        df = _fetch_history(candidate, start, end)
+        if df is None:
+            continue
+
+        if candidate != stock.symbol:
+            log.info(f"  ↻ Using alternative listing: {stock.symbol} → {candidate}")
+
+        df = df.reset_index()
+        df["Symbol"] = candidate
+        df["Company"] = stock.company
+        df["Index"] = stock.index
+
+        cols = [
+            "Date", "Symbol", "Company", "Index", "Open", "High", "Low",
+            "Close", "Adj Close", "Volume", "Dividends", "Stock Splits",
+        ]
+        missing = [c for c in cols if c not in df.columns]
+        if missing:
+            log.warning(f"  ⚠ {candidate} missing columns {missing}")
+            return None
+
+        return df[cols]
+
+    log.warning(f"  ⚠ No data for {stock.symbol} ({stock.company})")
+    return None
+
 
 def load_checkpoint(index_name: str) -> set[str]:
     """Load list of already-downloaded symbols from checkpoint."""
@@ -374,98 +248,116 @@ def save_checkpoint(index_name: str, completed_symbols: set[str]):
     except Exception as e:
         log.error(f"Could not save checkpoint: {e}")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN SCRAPER
-# ═══════════════════════════════════════════════════════════════════════════════
 
-def scrape_index(index_name: str, stocks: list[Stock], start_date: str, end_date: str):
-    """Download historical data for all stocks in an index."""
-    
+def write_output(output_file: Path, new_data: list[pd.DataFrame]) -> int:
+    """Merge freshly downloaded frames into the index CSV, returning total rows.
+
+    A resumed run only downloads the symbols missing from the checkpoint, so the
+    existing rows must be preserved instead of overwritten.
+    """
+    combined = pd.concat(new_data, ignore_index=True)
+
+    if output_file.exists():
+        try:
+            existing = pd.read_csv(output_file)
+            # Re-downloaded symbols win; everything else is carried forward.
+            kept = existing[~existing["Symbol"].isin(combined["Symbol"].unique())]
+            combined = pd.concat([kept, combined], ignore_index=True)
+        except Exception as e:
+            log.warning(f"Could not merge with existing {output_file.name}: {e}")
+
+    combined = combined.sort_values(["Symbol", "Date"]).reset_index(drop=True)
+    combined.to_csv(output_file, index=False)
+    return len(combined)
+
+
+def scrape_index(index_name: str, stocks: list[Stock], start_date: str, end_date: str) -> bool:
+    """Download historical data for all stocks in an index. True if data landed."""
+
     if not stocks:
         log.error(f"No stocks found for {index_name}")
-        return
-    
+        return False
+
     log.info(f"═══ Starting {index_name.upper()} Download ═══")
     log.info(f"  Stocks: {len(stocks)}")
     log.info(f"  Date Range: {start_date} to {end_date}")
     log.info(f"  Workers: {MAX_WORKERS}")
-    
+
     # Load checkpoint
     completed = load_checkpoint(index_name)
     if completed:
         log.info(f"  ↻ Resuming: {len(completed)} stocks already downloaded")
-    
-    # Validate tickers
-    log.info("Validating ticker symbols...")
-    valid_stocks = []
-    for stock in stocks:
-        if stock.symbol in completed:
-            continue
-        
-        validated = validate_and_fix_ticker(stock)
-        if validated:
-            valid_stocks.append(validated)
-    
-    log.info(f"  ✓ {len(valid_stocks)} stocks to download")
-    
-    if not valid_stocks:
+
+    pending = [s for s in stocks if s.symbol not in completed]
+    log.info(f"  ✓ {len(pending)} stocks to download")
+
+    if not pending:
         log.info("  All stocks already downloaded!")
-        return
-    
+        return True
+
     # Prepare output
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     output_file = OUTPUT_DIR / f"{index_name}_ticker.csv"
-    
+
     # Download in parallel
-    stats = DownloadStats(total=len(valid_stocks))
+    stats = DownloadStats(total=len(pending))
     all_data = []
-    
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # Submit all download tasks
         future_to_stock = {
             executor.submit(download_stock_data, stock, start_date, end_date): stock
-            for stock in valid_stocks
+            for stock in pending
         }
-        
-        # Process completed downloads
+
         for future in as_completed(future_to_stock):
             stock = future_to_stock[future]
-            
+
             try:
                 df = future.result()
-                
+
                 if df is not None and not df.empty:
                     all_data.append(df)
                     completed.add(stock.symbol)
                     stats.success += 1
                     log.info(f"  ✓ [{stats.success}/{stats.total}] {stock.symbol} ({len(df)} rows)")
+
+                    # Checkpoint periodically so a crash keeps most progress.
+                    if stats.success % 10 == 0:
+                        save_checkpoint(index_name, completed)
                 else:
                     stats.failed += 1
                     log.warning(f"  ✗ [{stats.success + stats.failed}/{stats.total}] {stock.symbol} - No data")
-                
-                # Save checkpoint every 10 stocks
-                if stats.success % 10 == 0:
-                    save_checkpoint(index_name, completed)
-            
+
             except Exception as e:
                 stats.failed += 1
                 log.error(f"  ✗ [{stats.success + stats.failed}/{stats.total}] {stock.symbol} - {e}")
-    
-    # Save all data to CSV
+
     if all_data:
         log.info(f"Saving data to {output_file}...")
-        combined_df = pd.concat(all_data, ignore_index=True)
-        combined_df.to_csv(output_file, index=False)
-        log.info(f"  ✓ Saved {len(combined_df)} rows to {output_file}")
-    
-    # Save final checkpoint
-    save_checkpoint(index_name, completed)
-    
-    log.info(f"═══ DONE ═══  {stats.summary()}")
+        total_rows = write_output(output_file, all_data)
+        log.info(f"  ✓ Saved {total_rows} rows to {output_file}")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# INTERACTIVE MENU
-# ═══════════════════════════════════════════════════════════════════════════════
+    save_checkpoint(index_name, completed)
+
+    log.info(f"═══ DONE ═══  {stats.summary()}")
+    return bool(all_data)
+
+
+def run_indices(choice: str, start_date: str, end_date: str) -> tuple[list[str], list[str]]:
+    """Fetch and scrape the requested indices. Returns (written, skipped) names."""
+    targets = list(NSE_INDEX_FILES) if choice == "all" else [choice]
+
+    written, skipped = [], []
+    for index_name in targets:
+        stocks = fetch_constituents(index_name)
+        if stocks and scrape_index(index_name, stocks, start_date, end_date):
+            written.append(index_name)
+        else:
+            skipped.append(index_name)
+        print()  # blank line between indices
+
+    return written, skipped
+
 
 def print_menu():
     """Display the interactive menu."""
@@ -553,35 +445,21 @@ def interactive_mode():
         print("  STARTING DOWNLOAD...")
         print("═" * 70 + "\n")
         
-        # Fetch constituent lists
-        indices_to_scrape = []
-        
-        if index_name in ["nifty50", "all"]:
-            stocks = fetch_nifty50_constituents()
-            if stocks:
-                indices_to_scrape.append(("nifty50", stocks))
-        
-        if index_name in ["nifty100", "all"]:
-            stocks = fetch_nifty100_constituents()
-            if stocks:
-                indices_to_scrape.append(("nifty100", stocks))
-        
-        if index_name in ["nifty200", "all"]:
-            stocks = fetch_nifty200_constituents()
-            if stocks:
-                indices_to_scrape.append(("nifty200", stocks))
-        
-        # Scrape each index
-        for idx_name, stocks in indices_to_scrape:
-            scrape_index(idx_name, stocks, START_DATE, END_DATE)
-            print()  # blank line between indices
-        
+        done, skipped = run_indices(index_name, START_DATE, END_DATE)
+
         print("\n" + "═" * 70)
-        print("  ✅ DOWNLOAD COMPLETED!")
+        if done:
+            print("  ✅ DOWNLOAD COMPLETED!")
+        else:
+            print("  ⚠️  DOWNLOAD FAILED - no data saved")
         print("═" * 70)
-        print(f"  📂 Files saved in: {OUTPUT_DIR}")
+        if done:
+            print(f"  📂 Files saved in: {OUTPUT_DIR}")
+            print(f"  ✓ Indices written: {', '.join(done)}")
+        if skipped:
+            print(f"  ✗ Indices skipped: {', '.join(skipped)}")
         print("═" * 70 + "\n")
-        
+
         # Ask if user wants to continue
         while True:
             again = input("📥 Download another index? (y/n): ").strip().lower()
@@ -593,9 +471,6 @@ def interactive_mode():
             else:
                 print("❌ Please enter 'y' or 'n'")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CLI MODE (for advanced users)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def cli_mode():
     """Run the scraper in command-line mode (with arguments)."""
@@ -625,28 +500,15 @@ def cli_mode():
     log.info(f"  Date Range: {args.start} to {args.end}")
     log.info(f"  Output Dir: {OUTPUT_DIR}")
     
-    # Fetch constituent lists
-    indices_to_scrape = []
-    
-    if args.index in ["nifty50", "all"]:
-        stocks = fetch_nifty50_constituents()
-        if stocks:
-            indices_to_scrape.append(("nifty50", stocks))
-    
-    if args.index in ["nifty100", "all"]:
-        stocks = fetch_nifty100_constituents()
-        if stocks:
-            indices_to_scrape.append(("nifty100", stocks))
-    
-    if args.index in ["nifty200", "all"]:
-        stocks = fetch_nifty200_constituents()
-        if stocks:
-            indices_to_scrape.append(("nifty200", stocks))
-    
-    # Scrape each index
-    for index_name, stocks in indices_to_scrape:
-        scrape_index(index_name, stocks, args.start, args.end)
-        print()  # blank line between indices
+    done, skipped = run_indices(args.index, args.start, args.end)
+
+    if skipped:
+        log.warning(f"Indices skipped: {', '.join(skipped)}")
+    if not done:
+        log.error("No data was saved")
+        raise SystemExit(1)
+
+    log.info(f"Indices written: {', '.join(done)}")
 
 def main():
     """Main entry point - choose between interactive or CLI mode."""
