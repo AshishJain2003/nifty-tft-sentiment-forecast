@@ -1,4 +1,4 @@
-# Nifty50 Trade Decision Support: News-Sentiment to TFT Forecasting Pipeline
+# Nifty TFT Sentiment Forecast
 
 ## What This Project Does
 
